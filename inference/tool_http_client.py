@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import requests
+from sandbox_gateway import SandboxGatewayError, shared_sandbox_run, close_shared_sandbox_run
 
 from runtime_env import get_env_bool, get_env_float, get_env_value
 
@@ -282,6 +283,12 @@ def tool_http_request(
     trace_fields: dict[str, Any] | None = None,
     config_overrides: dict[str, Any] | None = None,
 ) -> ToolHttpResponse:
+    if os.getenv("SCIENCE_AGENT_TOOL_HTTP_BACKEND", "").strip().lower() == "gateway_sandbox":
+        try:
+            return _sandbox_http_request(method=method, url=url, headers=headers, json_payload=json_payload)
+        except SandboxGatewayError:
+            if os.getenv("SCIENCE_AGENT_SANDBOX_HTTP_STRICT", "true").strip().lower() in {"1", "true", "yes", "on"}:
+                raise
     config = _apply_config_overrides(tool_http_config(prefix), config_overrides)
     trace_fields = dict(trace_fields or {})
     backend_order = [config["backend"]]
@@ -381,3 +388,20 @@ def tool_http_request(
 
     assert last_exc is not None
     raise last_exc
+
+
+def close_sandbox_http_run() -> None:
+    close_shared_sandbox_run()
+
+
+def _sandbox_http_request(*, method: str, url: str, headers: dict[str, str] | None, json_payload: Any) -> ToolHttpResponse:
+    run = shared_sandbox_run()
+    payload = {"method": method, "url": url, "headers": headers or {}, "json": json_payload}
+    result = run.run_http(payload, timeout=int(os.getenv("TOOL_HTTP_SANDBOX_TIMEOUT", "180")))
+    return ToolHttpResponse(
+        status_code=int(result.get("status_code", 0)),
+        text=str(result.get("text", "")),
+        backend="gateway_sandbox",
+        duration_s=float(result.get("duration_s", 0)),
+        headers=result.get("headers") or {},
+    )

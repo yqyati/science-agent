@@ -15,6 +15,7 @@ from tool_runtime_registry import (
     canonicalize_tool_name,
     schema_tool_name,
 )
+from tool_http_client import close_sandbox_http_run
 
 
 ORIGINAL_TODAY_DATE = base_module.today_date
@@ -28,6 +29,8 @@ def openai_compat_current_date() -> str:
 
 class MultiTurnReactAgent(BaseMultiTurnReactAgent):
     def __init__(self, function_list=None, llm=None, **kwargs):
+        if not function_list and os.getenv("SCIENCE_AGENT_TOOLS", "").strip():
+            function_list = [name.strip() for name in os.environ["SCIENCE_AGENT_TOOLS"].split(",") if name.strip()]
         super().__init__(function_list=function_list, llm=llm, **kwargs)
         runtime = build_tool_runtime(function_list, default_tools=["search", "visit"])
         schema_snapshot = os.getenv("SCIENCE_AGENT_TOOL_SCHEMAS_FILE")
@@ -82,7 +85,11 @@ class MultiTurnReactAgent(BaseMultiTurnReactAgent):
         )
 
     def reset_tool_runtime_state(self) -> None:
+        close_sandbox_http_run()
         for tool in self.active_tools:
+            close_sandbox = getattr(tool, "close_sandbox", None)
+            if callable(close_sandbox):
+                close_sandbox()
             reset = getattr(tool, "reset_jupyter_history", None)
             if callable(reset):
                 reset()

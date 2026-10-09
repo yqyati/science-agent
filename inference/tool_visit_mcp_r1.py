@@ -11,10 +11,10 @@ from openai import OpenAI
 import random
 from urllib.parse import urlparse, unquote
 import time 
-import tiktoken
 import httpx
 from runtime_env import get_env_float, get_env_int
 from tool_http_client import tool_http_config, tool_http_request
+from sandbox_gateway import shared_sandbox_run
 from tool_provider_strategy import provider_strategy, strategy_visit
 from tool_url_guard import (
     GUARD_FORMAT_VISIT_FINAL_V1,
@@ -25,6 +25,7 @@ from tool_url_guard import (
     is_text_blocked,
     is_url_blocked,
     is_value_blocked,
+    current_guard_context, capture_guard_context, guard_fingerprint,
 )
 
 try:
@@ -62,9 +63,6 @@ WEBCONTENT_MAXLENGTH = int(os.getenv("WEBCONTENT_MAXLENGTH", 150000))
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CACHE_DIR = os.environ.get("DR_CACHE_DIR", os.path.join(PROJECT_DIR, ".cache", "dr"))
 DR_CACHE_LOG = os.environ.get("DR_CACHE_LOG", "").strip().lower() in {"1", "true", "yes", "on"}
-TIKTOKEN_CACHE_DIR = os.path.join(CACHE_DIR, "tiktoken")
-os.makedirs(TIKTOKEN_CACHE_DIR, exist_ok=True)
-os.environ["TIKTOKEN_CACHE_DIR"] = TIKTOKEN_CACHE_DIR
 
 JINA_API_KEYS = [
     key.strip()
@@ -130,17 +128,6 @@ def write_cache_log(path: str, payload: dict, label: str) -> None:
 
 def _is_blocked_visit_response(value: object) -> bool:
     return isinstance(value, str) and value == blocked_visit_message()
-
-
-def truncate_to_tokens(text: str, max_tokens: int = 95000) -> str:
-    encoding = tiktoken.get_encoding("cl100k_base")
-    
-    tokens = encoding.encode(text)
-    if len(tokens) <= max_tokens:
-        return text
-    
-    truncated_tokens = tokens[:max_tokens]
-    return encoding.decode(truncated_tokens)
 
 
 def _evidence_units(text: str, max_units: int) -> str:
@@ -266,7 +253,17 @@ OSS_JSON_FORMAT = """# Response Formats
 class Visit(BaseTool):
     # The `description` tells the agent the functionality of this tool.
     name = 'read-page-server-read_page'
-    description = "Read known webpage URLs for targeted evidence extraction in science/research reasoning; use after search or when a URL is given, not for broad discovery."
+    description = (
+        "Fetch a known webpage URL after search or when a URL is given. In Sandbox file mode, "
+        "save the complete reader-provided Markdown in this Agent's /workspace/pages directory. "
+        "Return the file path, source URL, character/line counts, and a short preview; "
+        "the response is not the full page and no LLM summary is generated. "
+        "Next use the Python tool to read the returned relative path from /workspace with UTF-8. "
+        "Search for relevant terms or inspect line ranges, and print original evidence with line numbers "
+        "and surrounding context. Do not assume information absent from the preview is absent from the page. "
+        "Keep each Python output short; if it reports truncation, read smaller ranges to recover omitted evidence. "
+        "Repeated visits reuse the saved page within this Agent run."
+    )
     # The `parameters` tell the agent what input parameters the tool has.
     parameters = {
         "type": "object",
@@ -281,7 +278,7 @@ class Visit(BaseTool):
         },
         "goal": {
                 "type": "string",
-                "description": "The goal of the visit for webpage(s)."
+                "description": "The research question or evidence to look for. In file mode the page is saved in full; use Python afterward to locate evidence for this goal."
         }
         },
         "required": ["url", "goal"]
@@ -350,7 +347,7 @@ class Visit(BaseTool):
                     response.append(cur_response)
             response = "\n=======\n".join(response)
         
-        print(f'Summary Length {len(response)}; Summary Content {response}')
+        print(f'Read page response chars: {len(response)}')
         return response.strip()
         
     def call_server(self, msgs, max_retries=2):
@@ -361,7 +358,10 @@ class Visit(BaseTool):
         reasoning_effort = str(os.environ.get("SUMMARY_REASONING_EFFORT") or "").strip().lower()
         if reasoning_effort not in {"low", "medium", "high"}:
             reasoning_effort = ""
-        client = OpenAI(
+        sandbox_http = os.getenv("SCIENCE_AGENT_TOOL_HTTP_BACKEND", "").strip().lower() == "gateway_sandbox"
+        if sandbox_http and not all((api_key, url_llm, model_name)):
+            raise ValueError("Sandbox readpage requires API_BASE, API_KEY and SUMMARY_MODEL_NAME in sandbox.local.env")
+        client = None if sandbox_http else OpenAI(
             api_key=api_key,
             base_url=url_llm,
             timeout=SUMMARY_REQUEST_TIMEOUT_SEC,
@@ -388,8 +388,21 @@ class Visit(BaseTool):
                 }
                 if reasoning_effort:
                     request_kwargs["extra_body"] = {"reasoning_effort": reasoning_effort}
-                chat_response = client.chat.completions.create(**request_kwargs)
-                content = chat_response.choices[0].message.content
+                if sandbox_http:
+                    payload = dict(request_kwargs)
+                    payload.update(payload.pop("extra_body", {}))
+                    response = tool_http_request(
+                        prefix="SUMMARY", method="POST",
+                        url=url_llm.rstrip("/") + "/chat/completions",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        json_payload=payload,
+                        trace_layer="tool_visit", trace_event="summary_request",
+                    )
+                    response.raise_for_status()
+                    content = response.json()["choices"][0]["message"].get("content")
+                else:
+                    chat_response = client.chat.completions.create(**request_kwargs)
+                    content = chat_response.choices[0].message.content
                 emit_trace(
                     "summary_request_end",
                     layer="tool_visit",
@@ -569,6 +582,34 @@ class Visit(BaseTool):
             str: The webpage content or error message
         """
    
+        if os.getenv("SCIENCE_AGENT_READ_PAGE_MODE", "").strip().lower() == "file":
+            if os.getenv("SCIENCE_AGENT_TOOL_HTTP_BACKEND") != "gateway_sandbox":
+                return "[read_page] File mode requires gateway_sandbox"
+            context = current_guard_context() or capture_guard_context()
+            request_url, headers = self._build_jina_request(url)
+            headers["X-Return-Format"] = "markdown"
+            for attempt in range(_visit_read_max_retries()):
+                try:
+                    result = shared_sandbox_run().run_http({
+                        "method": "GET", "url": request_url, "headers": headers,
+                        "save_page": True, "source_url": url,
+                        "guard_snapshot": context.snapshot.to_dict(),
+                        "guard_fingerprint": guard_fingerprint(context),
+                    }, timeout=tool_http_config("JINA")["max_time"])
+                    if result["status_code"] == 200:
+                        page = result["page"]
+                        if page.get("blocked"):
+                            return blocked_visit_message()
+                        emit_trace("read_page_saved", layer="tool_visit", url=url,
+                                   path=page["path"], page_chars=page["characters"], cached=page.get("cached", False))
+                        return json.dumps(dict(page, instruction="This is a file description and preview, not the full page. Use Python to read the relative path from /workspace with UTF-8. Print relevant original lines with line numbers and context. If output is truncated, read smaller line ranges."), ensure_ascii=False)
+                    error = f"HTTP {result['status_code']}: {result.get('text', '')[:500]}"
+                except Exception as exc:
+                    error = str(exc)
+                if attempt + 1 < _visit_read_max_retries():
+                    time.sleep(_visit_retry_sleep_sec())
+            return "[read_page] Failed to save page: " + error
+
         pipeline_started_at = time.time()
         emit_trace(
             "read_page_pipeline_start",
@@ -586,7 +627,9 @@ class Visit(BaseTool):
                 return blocked_visit_message()
 
             if content and not content.startswith("[read_page] Failed") and content != "[read_page] Empty content." and not content.startswith("[document_parser]"):
-                content = truncate_to_tokens(content, max_tokens=95000)
+                if os.getenv("SCIENCE_AGENT_READ_PAGE_MODE", "").strip().lower() == "extractive":
+                    return _extractive_visit_return(url, goal, content)
+                content = content[:WEBCONTENT_MAXLENGTH]
                 messages = [{"role":"user","content": EXTRACTOR_PROMPT.format(webpage_content=content, goal=goal)}]
                 parse_retry_times = 0
                 raw = summary_page_func(messages, max_retries=max_retries)

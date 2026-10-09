@@ -19,6 +19,8 @@ from tool_python import (
     SANDBOX_FUSION_ENDPOINTS,
     TOOL_OUTPUTS_DIR,
     PythonInterpreter,
+    PYTHON_SESSION_BACKEND,
+    SANDBOX_GATEWAY_BACKEND,
     _coerce_current_jupyter_cell,
     blocked_python_message,
     _drop_checkpoint_response_files,
@@ -33,6 +35,7 @@ from tool_python import (
     _merge_fetch_files,
     _sha256_text,
 )
+from sandbox_gateway import shared_sandbox_run
 
 
 DATA_IMAGE_RE = re.compile(r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.*)$", re.DOTALL)
@@ -661,6 +664,19 @@ class VisualPythonInterpreter(PythonInterpreter):
                     return format_path_policy_error("Visual Python Interpreter", violations)
             if not code.strip():
                 return "[Visual Python Interpreter Error]: Empty code."
+            if PYTHON_SESSION_BACKEND == SANDBOX_GATEWAY_BACKEND:
+                run = shared_sandbox_run()
+                self._agent_sandbox = run
+                data = run.run_visual(
+                    VISUAL_SETUP_CELL + "\n" + code,
+                    self._input_files,
+                    timeout=PYTHON_TOOL_TIMEOUT_SEC if timeout is None else int(timeout),
+                )
+                text_output = str(data.get("stdout") or "") + str(data.get("stderr") or "") + str(data.get("error") or "")
+                images = [(image["mime_type"], image["data"]) for image in data.get("images", [])]
+                self._last_artifact_entries = []
+                artifact_paths = self._save_image_artifacts(images)
+                return self._format_response(text_output, images, artifact_paths)
             if not SANDBOX_FUSION_ENDPOINTS:
                 return missing_sandbox_fusion_endpoint_message()
 

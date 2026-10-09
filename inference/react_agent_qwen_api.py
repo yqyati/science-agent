@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import httpx
+from sandbox_gateway import sandbox_run_scope
 from openai import APIConnectionError, APIError, APITimeoutError, OpenAI
 from qwen_agent.agents.fncall_agent import FnCallAgent
 from qwen_agent.llm import BaseChatModel
@@ -100,6 +101,21 @@ AGENT_CONTEXT_COMPACT_SUMMARY_MODEL = os.getenv("AGENT_CONTEXT_COMPACT_SUMMARY_M
 AGENT_CONTEXT_COMPACT_MAX_ATTEMPTS = max(
     1,
     get_env_int("AGENT_CONTEXT_COMPACT_MAX_ATTEMPTS", default=3),
+)
+
+# Opt-in evaluation-only observation masking.  The authoritative ``messages``
+# history remains unchanged for tool execution and diagnostics; masking is
+# applied only to the request View sent to the model.  This is deliberately
+# disabled by default so existing training and evaluation processes are
+# unaffected unless they explicitly opt in.
+AGENT_OBSERVATION_MASKING = get_env_bool("AGENT_OBSERVATION_MASKING", default=False)
+AGENT_OBSERVATION_MASKING_WINDOW = max(
+    0,
+    get_env_int("AGENT_OBSERVATION_MASKING_WINDOW", default=8),
+)
+AGENT_OBSERVATION_MASKING_PLACEHOLDER = os.getenv(
+    "AGENT_OBSERVATION_MASKING_PLACEHOLDER",
+    "<MASKED>",
 )
 
 VERBOSE_AGENT_LOGS = os.getenv("VERBOSE_AGENT_LOGS", "0").lower() in {
@@ -1147,6 +1163,8 @@ class MultiTurnReactAgent(FnCallAgent):
         self.adaptive_context_mgr = None
         self._tool_multimodal_response_fallback = False
         self._fallback_message_lists = []
+        self._context_tokenizer = None
+        self._context_tokenizer_unavailable = False
 
     def _infer_tool_status(self, tool_response: str) -> str:
         text = (tool_response or "").lower()
@@ -1208,6 +1226,38 @@ class MultiTurnReactAgent(FnCallAgent):
 
     def _set_fallback_message_lists(self, *message_lists) -> None:
         self._fallback_message_lists = [item for item in message_lists if isinstance(item, list)]
+
+    @staticmethod
+    def _observation_masked_view(messages):
+        """Return the optional model-facing view with old tool observations masked.
+
+        ``messages`` is the authoritative conversation history used for tool
+        execution, result serialization, and retries.  This helper always
+        deep-copies it, so the default-disabled path and the caller's history
+        are unchanged.  Only ``role=tool`` message content is eligible; the
+        assistant tool call, tool name, and call id remain visible so the
+        model still sees the conversation structure.
+        """
+        if not AGENT_OBSERVATION_MASKING or not isinstance(messages, list):
+            return messages
+
+        tool_indexes = [
+            index
+            for index, message in enumerate(messages)
+            if isinstance(message, dict) and message.get("role") == "tool"
+        ]
+        keep = AGENT_OBSERVATION_MASKING_WINDOW
+        mask_indexes = tool_indexes[:-keep] if keep else tool_indexes
+        if not mask_indexes:
+            return messages
+
+        view = copy.deepcopy(messages)
+        for index in mask_indexes:
+            message = view[index]
+            # A fixed text placeholder avoids leaking old tool output while
+            # preserving a valid OpenAI tool-message shape.
+            message["content"] = AGENT_OBSERVATION_MASKING_PLACEHOLDER
+        return view
 
     def _maybe_downgrade_multimodal_tool_messages(
         self,
@@ -2661,11 +2711,51 @@ class MultiTurnReactAgent(FnCallAgent):
         )
 
     def count_tokens(self, messages):
-        del messages
-        return 0
+        """Count the request tokens used for context management.
+
+        Prefer the model's local chat-template tokenizer so the count includes
+        the actual role/tool formatting. Fall back to the API request estimator
+        when the tokenizer is unavailable; context management must remain best
+        effort rather than breaking a rollout during tokenizer initialization.
+        """
+        try:
+            tool_schemas = self._active_tool_schemas_for_current_task()
+        except Exception:
+            tool_schemas = None
+        if not self._context_tokenizer_unavailable and self._context_tokenizer is None:
+            try:
+                from transformers import AutoTokenizer
+
+                self._context_tokenizer = AutoTokenizer.from_pretrained(
+                    self.llm_local_path,
+                    local_files_only=True,
+                    trust_remote_code=True,
+                )
+            except Exception:
+                self._context_tokenizer_unavailable = True
+        if self._context_tokenizer is not None:
+            try:
+                kwargs = {
+                    "tokenize": True,
+                    "add_generation_prompt": True,
+                }
+                if tool_schemas:
+                    kwargs["tools"] = tool_schemas
+                encoded = self._context_tokenizer.apply_chat_template(
+                    messages,
+                    **kwargs,
+                )
+                if isinstance(encoded, dict):
+                    encoded = encoded.get("input_ids", [])
+                if hasattr(encoded, "shape"):
+                    return int(encoded.shape[-1])
+                return len(encoded)
+            except Exception:
+                pass
+        return estimate_request_input_tokens(messages, tool_schemas)
 
     def _estimate_trajectory_tokens(self, messages):
-        return max(0, len(json.dumps(messages, ensure_ascii=False, default=str)) // 4)
+        return self.count_tokens(messages)
 
     def _append_budget_notice(self, content, messages):
         used_tokens = self._estimate_trajectory_tokens(
@@ -2933,7 +3023,7 @@ class MultiTurnReactAgent(FnCallAgent):
                 else None
             )
             response, usage = self.call_server(
-                final_messages,
+                self._observation_masked_view(final_messages),
                 planning_port,
                 tool_schemas=[],
                 max_output_tokens=forced_max_output_tokens,
@@ -3084,6 +3174,7 @@ class MultiTurnReactAgent(FnCallAgent):
             "tool_calls": serialized_tool_calls,
         }, usage
 
+    @sandbox_run_scope
     def _run(self, data: str, served_model_name: Optional[str] = None, **kwargs) -> List[List[Message]]:
         del kwargs
         if served_model_name:
@@ -3156,8 +3247,9 @@ class MultiTurnReactAgent(FnCallAgent):
             round_idx += 1
             num_llm_calls_available -= 1
             self._set_fallback_message_lists(messages, passin_messages)
+            request_messages = self._observation_masked_view(passin_messages)
             response, usage = self.call_server(
-                passin_messages,
+                request_messages,
                 planning_port,
                 tool_schemas=self._active_tool_schemas_for_current_task(),
             )
@@ -3358,8 +3450,9 @@ class MultiTurnReactAgent(FnCallAgent):
                     "termination": termination,
                 })
 
-            max_tokens = 128 * 1024
-            token_count = self.count_tokens(passin_messages)
+            max_tokens = TRAJECTORY_MAX_TOKENS
+            request_messages = self._observation_masked_view(passin_messages)
+            token_count = self.count_tokens(request_messages)
             debug_print(f"round: {round_idx}, token count: {token_count}")
 
             if token_count > max_tokens:
@@ -3410,7 +3503,7 @@ class MultiTurnReactAgent(FnCallAgent):
                     passin_messages[-1]["content"] = messages[-1]["content"]
                     self._set_fallback_message_lists(messages, passin_messages)
                     choice, usage = self.call_server(
-                        passin_messages,
+                        self._observation_masked_view(passin_messages),
                         planning_port,
                         tool_schemas=self._active_tool_schemas_for_current_task(),
                     )

@@ -21,6 +21,7 @@ from tool_path_policy import (
     format_path_policy_error,
     should_enforce_relative_paths,
 )
+from sandbox_gateway import AgentSandboxRun, SandboxGatewayError, shared_sandbox_run
 from tool_url_guard import blocked_python_message, is_text_blocked, is_value_blocked
 
 try:
@@ -119,6 +120,7 @@ PYTHON_SESSION_BACKEND = (
     or os.getenv("PYTHON_JUPYTER_BACKEND")
     or "sandbox_checkpoint"
 ).strip().lower()
+SANDBOX_GATEWAY_BACKEND = "gateway_sandbox"
 PYTHON_CHECKPOINT_MAX_BYTES_MB = max(
     1,
     get_env_int("PYTHON_CHECKPOINT_MAX_BYTES_MB", default=256),
@@ -431,10 +433,11 @@ def _truncate_python_tool_return(output: str, *, code_hash: str = "", checkpoint
 
     notice = (
         "\n\n[Python tool output truncated: "
-        f"original_chars={original_chars}, returned_chars={max_chars}. "
-        "The code executed normally. Large stdout/display was shortened only "
-        "in the model-visible tool response. If you need the full content, "
-        f"save it to {TOOL_OUTPUTS_DIR}/ and read smaller slices.]\n\n"
+        f"original_chars={original_chars}, output_limit_chars={max_chars} (including this notice). "
+        "The output exceeded the length limit; the middle was omitted and the beginning/end retained. "
+        "This is an incomplete output, not the complete evidence. Files in the sandbox are unchanged. "
+        "For a saved page, read smaller line ranges from its path and print line numbers with context. "
+        f"For computed results, save them to {TOOL_OUTPUTS_DIR}/ and read smaller slices.]\n\n"
     )
     budget = max_chars - len(notice)
     if budget <= 0:
@@ -1875,6 +1878,7 @@ class PythonInterpreter(BaseToolWithFileAccess):
         self._sandbox_endpoint: Optional[str] = None
         self._artifact_dir: Optional[Path] = None
         self._last_artifact_entries: list[dict[str, Any]] = []
+        self._agent_sandbox: AgentSandboxRun | None = None
         # self.summary_mapping = SummaryMapping()
 
     def reset_jupyter_history(self) -> None:
@@ -1888,6 +1892,15 @@ class PythonInterpreter(BaseToolWithFileAccess):
         self._checkpoint_last_state_restore_failed = False
         self._sandbox_endpoint = None
         self._last_artifact_entries = []
+        if self._agent_sandbox is not None:
+            self._agent_sandbox.close()
+        self._agent_sandbox = None
+
+    def close_sandbox(self) -> None:
+        """Release the run-scoped gateway Sandbox, if this backend owns one."""
+        if self._agent_sandbox is not None:
+            self._agent_sandbox.close()
+            self._agent_sandbox = None
 
     def set_task_context(
         self,
@@ -2680,6 +2693,17 @@ class PythonInterpreter(BaseToolWithFileAccess):
                 return path_policy_error
             if not code.strip():
                 return '[Python Interpreter Error]: Empty code.'
+            if PYTHON_SESSION_BACKEND == SANDBOX_GATEWAY_BACKEND:
+                run = shared_sandbox_run()
+                self._agent_sandbox = run
+                try:
+                    result = run.run_python(
+                        code,
+                        timeout=PYTHON_TOOL_TIMEOUT_SEC if timeout is None else int(timeout),
+                    )
+                    return _truncate_python_tool_return(result, code_hash=_sha256_text(code)) or PYTHON_TOOL_NO_OUTPUT_MESSAGE
+                except SandboxGatewayError as exc:
+                    return f"[Python Interpreter Error]: {exc}"
             last_error = None
             timeout = PYTHON_TOOL_TIMEOUT_SEC if timeout is None else int(timeout)
             max_attempts = _effective_python_tool_max_attempts(timeout)

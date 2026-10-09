@@ -1,0 +1,249 @@
+# Sandbox backend
+
+This harness copy uses one Sandbox per Agent run. Python, search, visit, and
+readpage summary HTTP requests reuse that instance. The gateway mode is opt-in;
+other backends keep their existing behavior.
+
+## Local configuration and login
+
+`sandbox.local.env` stores local API settings and is ignored by Git. If it does
+not exist, copy `sandbox.local.env.example` and fill `API_KEY` and
+`SUMMARY_MODEL_NAME`. `API_BASE` is the OpenAI-compatible base URL including
+`/v1`, for example `http://35.220.164.252:3888/v1`. Configure `SERPER_API_KEY`
+for real search and optional `JINA_API_KEY` for the page reader.
+
+The approved resource is `10.12.111.143/ailab-ma4agismall`.
+The local configuration explicitly sets
+`SCIENCE_AGENT_SANDBOX_NETWORK_DEFAULT_ACTION=allow` for online tools.
+The client expresses this as default-deny with explicit allow rules for
+`0.0.0.0/0` and `::/0`. This avoids the platform's invalid Cilium policy
+generation for default-allow with an empty egress list.
+Without this setting, the platform chooses the default egress policy.
+
+```bash
+python3 platform_ad_auth.py -- bash
+bash run_sandbox_harness.sh python3 sandbox_smoke.py
+bash run_sandbox_harness.sh python3 sandbox_smoke.py --llm
+bash run_sandbox_harness.sh python3 sandbox_smoke.py --llm --tools
+```
+
+Login once before starting the workload. Child Agents inherit the gateway Token;
+creating an instance does not require another login. The platform documentation
+specifies a 15-day Token lifetime; reauthenticate after expiry.
+
+For rjob evaluation, save the Token in the shared local config before
+submission (the file is ignored by Git and saved with mode 600):
+
+```bash
+python3 platform_ad_auth.py --save-token sandbox.local.env
+```
+
+Inside the rjob container, launch the evaluation entrypoint through
+`bash /absolute/project/path/run_sandbox_harness.sh <evaluation command>`.
+The wrapper exports the saved `OPEN_SANDBOX_GATEWAY_TOKEN`; no interactive
+login is needed in the job. The same shared path must be mounted in the job.
+Repeat the save command before expiry. The AD password is never saved.
+
+## Runtime
+
+Instances are created lazily with ports 44772 (command), 18080 (Python), and
+18081 (HTTP). Worker files are uploaded automatically to `/tmp` through the
+command endpoint. No custom image build is needed. Both workers must pass
+`/health` before use; initialization errors are reported without silently
+switching to single-shot Python or host HTTP.
+
+`QwenReactAgent._run` has a gateway-only run scope and deletes the instance in
+`finally`. Direct tool callers must invoke `close_sandbox_http_run()` or
+`close_shared_sandbox_run()` in `finally`. Python state persists within a run.
+The HTTP transport preserves upstream HTTP error status and body.
+
+## Validation status
+
+On October 8, live create/command/delete and persistent Python (42 then 41)
+passed. On October 9, offline regression checks cover run isolation, shared
+Python/HTTP use, cleanup, HTTP error bodies, and Sandbox summary routing.
+Live 18081 and persistent Python passed. Public DNS fallback and TCP access to
+the LLM API passed. TLS verification for google.serper.dev and r.jina.ai passed;
+example.com returned a Fortinet-issued certificate and failed verification.
+The live HTTP smoke through `https://r.jina.ai/https://example.com` returned
+200 with the expected page content. Python persistence, shared run, and cleanup
+also passed on instance `cprod3-z67en409ad2vdm68ecya`. A later live smoke on
+`cprod2-qt0dpqwz1wtdy20gelhn` also passed the summary LLM request using
+`bailian/deepseek-v4.1-flash`, shared run, and cleanup. A prior LLM attempt
+returned HTTP 503; retry succeeded without code changes. Full Search/Visit
+tool calls and the rjob evaluation entrypoint remain to be verified. The current shell has no gateway Token and the local
+summary model name is empty. The current Python environment also lacks
+`qwen_agent`, required for the optional real Search/Visit test.
+
+## DNS fallback
+
+Live diagnostics showed the configured resolver `169.254.25.10` timed out,
+while public-IP TCP and the LLM API TCP connection worked. The local setting
+`SCIENCE_AGENT_SANDBOX_DNS_SERVERS=1.1.1.1,8.8.8.8` probes those DNS servers
+and updates only the new instance's `/etc/resolv.conf` with working servers.
+If none answer, initialization fails and the instance is cleaned up. Remove
+this setting to use the platform resolver, especially for Kubernetes service
+names requiring cluster DNS. No host DNS configuration is changed.
+
+## TLS certificates
+
+`SCIENCE_AGENT_SANDBOX_CA_BUNDLE=auto` combines the host Python CA bundle,
+system CA bundle, and certifi certificates, removes duplicates, validates the
+bundle, and uploads it to the new Sandbox. Workers use it through
+`SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE`; HTTPS certificate verification
+remains enabled. An explicit PEM file path can be used instead of `auto`.
+Live HTTPS still needs smoke validation; a platform TLS interception CA may
+need to be supplied if it is absent from all host bundles.
+`--diagnose-network` also inspects the TLS certificate chains for example.com,
+google.serper.dev, and r.jina.ai using openssl. It reports certificate subjects,
+issuers, fingerprints, and verification errors without sending HTTP requests
+or credentials. This distinguishes a missing platform CA from an incomplete
+public website certificate chain; it does not disable tool TLS verification.
+
+The default HTTP smoke URL is now `https://r.jina.ai/https://example.com`,
+matching the page-reader route. A passing result validates this route only.
+Use `--http-url https://example.com` to retest direct website access, which
+still requires the platform's trusted Fortinet CA (issuer FG120GTK26007524).
+Do not trust a certificate fetched from the failing connection as a new root;
+obtain the CA from the platform administrator. Other directly accessed sites
+may also be subject to the same platform TLS inspection.
+
+## Vision backend
+
+With `PYTHON_SESSION_BACKEND=gateway_sandbox`, VisualPythonInterpreter now
+uses the same run-scoped Sandbox/Python worker as Python, search, and visit.
+Input images are uploaded to relative `input_images/` paths and unchanged
+files are not reuploaded. PIL images displayed with `display`, matplotlib
+`plt.show()`, and final-expression images return PNG data to the existing
+Vision response formatter, preserving image deduplication/resizing and local
+display artifact saving. The original SandboxFusion branch remains for other
+backends. No checkpoint/replay is used within a persistent gateway run.
+
+```bash
+bash run_sandbox_harness.sh python3 sandbox_smoke.py --vision --llm
+```
+
+The first live Vision smoke found matplotlib absent in the default image.
+Before its first Vision call, each instance now checks Pillow, matplotlib,
+and IPython and installs only missing packages using its Python pip. The
+worker validates imports before executing user code. Disable with
+`SCIENCE_AGENT_SANDBOX_INSTALL_VISION_DEPS=false`; a package mirror can be
+configured via `SCIENCE_AGENT_SANDBOX_PIP_INDEX_URL`. Installation is bounded
+to 300 seconds and errors are surfaced. For large rjob evaluations, preinstall
+these packages in the image to avoid repeated downloads for each instance. Offline crop/plot/image
+return, persistent state, upload deduplication, and path validation passed.
+The actual Sandbox image still requires the live Vision smoke above.
+
+The sandbox launcher defaults to `SCIENCE_AGENT_TOOLS=search,visit,python,google_scholar`. Vision is excluded unless explicitly requested. The Agent reads this setting when no explicit function_list is supplied. `sandbox_smoke.py --vision` is an explicit diagnostic and does not enable Vision for evaluation.
+
+## Isolated Molt evaluation smoke
+
+Use `labs-molt/examples/scripts/rjob/submit_hle3_base_sandbox_smoke.sh`.
+It submits four GPUs and three selected HLE text rows (source indices 0, 4, 10).
+The new entrypoint runs `evl/eval_molt_hle3_sandbox_smoke.sh`, preserving the
+base model, 8192-token response budget, 65536-token trajectory budget, and
+no masking/compaction. Four tools use the Sandbox transport; Vision is absent.
+Judge uses the configured API at `http://35.220.164.252:3888/v1` with model
+`o3-mini`. The isolated `science_legacy_react_sandbox.py` adapter sends Bearer
+authentication using SCIENCE_AGENT_JUDGE_API_KEY, falling back to API_KEY.
+Judge HTTP is executed by the Sandbox HTTP worker, never directly by the
+rjob host. Each nonempty candidate owns a separate lazy judge Sandbox because
+the Agent tool Sandbox is closed before grading. The three attempts reuse that
+instance; a finally block deletes it on success or failure. Cleanup errors are
+logged without replacing the grading result. Trace info includes
+`science_judge_backend=gateway_sandbox`. Empty candidates and F1 mode create
+no judge instance. The rjob preflight includes `sandbox_smoke.py --judge` to
+validate the configured judge model and authentication before loading vLLM.
+The original non-Sandbox evaluation scripts are not edited for this integration.
+
+Before submission, configure SERPER_API_KEY for both search tools. The job
+runs web search, scholar search, page read, and summary LLM preflight before
+loading vLLM. Output goes under `yangqingyu/eval/molt_hle3_sandbox/`, including
+eval.log, sandbox_preflight.log, sandbox_trace.jsonl, and rollout_dump.
+Serper HTTP 403 was traced to a comma-separated list sent as one API key.
+The list is retained in SERPER_API_KEYS and one key is selected in
+SERPER_API_KEY. Live web search, scholar search, page read, summary LLM, and
+o3-mini host judge preflight all passed. The first rjob
+`hle3-base-sandbox-smoke-20261009-142447-88012253` exited successfully, but
+its grading was invalid: two host-direct judge requests timed out after three
+attempts, and one empty candidate was skipped. The reported -6.6667 was the
+mean of failure rewards (0, -10, -10), not an accuracy. Page processing also
+stalled downloading tiktoken on the rjob host; that is a separate issue.
+The judge transport change addresses the host-direct timeouts and must still
+be checked in a new complete rjob evaluation.
+
+Judge transport validation: the actual async Sandbox adapter graded a fixed
+prime-factor candidate using the configured o3-mini API, returning
+`science_judge_valid=1`, reward 1, and `science_judge_backend=gateway_sandbox`.
+Policy generation was stubbed; judge HTTP, parsing, and cleanup used the
+production runtime. Full rjob evaluation has not been rerun.
+
+Lifecycle: both the Agent scope and the judge use finally cleanup. Deletion
+retries three times, logging the Sandbox ID on failure and retaining the ID
+if all attempts fail. A cancelled judge waits for its in-flight thread before
+deleting, preventing creation after cleanup. Process termination that bypasses
+finally (such as SIGKILL) relies on the gateway instance timeout, configured
+by SCIENCE_AGENT_SANDBOX_TIMEOUT (default 1800 seconds).
+
+Final local validation: 23 Sandbox tests passed, including async judge
+cancellation ordering and transient-delete retry. Molt compileall and bash
+syntax checks passed. The host has no pytest installed, so the complete Molt
+pytest suite could not run. A combined live smoke reached Jina HTTP 200 but
+its expected-page-text assertion failed before judge; its finally cleanup
+still completed. This does not invalidate the separate successful live
+judge-adapter test described above.
+
+The subsequent live smoke with
+`--judge --http-url https://r.jina.ai/http://example.com` passed Python
+persistence, outbound HTTP 200, o3-mini judge JSON grading, and cleanup.
+
+## Page files in the Agent workspace
+
+The Sandbox launcher defaults to SCIENCE_AGENT_READ_PAGE_MODE=file.
+read_page(url, goal) requests Jina from the Sandbox HTTP worker and stores
+the complete returned Markdown in /workspace/pages/<URL-hash>/content.md.
+source.json records the source/reader URLs, timestamp, length, preview, and
+evaluation guard fingerprint. The observation contains only metadata and
+a preview of at most 1000 characters. The host receives no full page text,
+and the file branch does not invoke tokenization or a summary model.
+The isolated Visit module no longer imports tiktoken or downloads encodings.
+
+The existing evaluation URL/text guard snapshot is evaluated in the worker
+before saving; blocked or failed content is not saved. Repeated same-run
+URLs reuse completed files under the same guard fingerprint. Changed guard
+policies force a refetch. URLs get separate filenames and concurrent Agents
+have distinct Sandbox filesystems. Files disappear with Sandbox deletion.
+
+Python and HTTP workers start in /workspace. Use the returned relative path
+with the existing Python tool, for example:
+
+```python
+from pathlib import Path
+lines = Path("pages/<page_id>/content.md").read_text(encoding="utf-8").splitlines()
+for index, line in enumerate(lines):
+    if "router freezing" in line.lower():
+        for number in range(max(0, index - 2), min(len(lines), index + 4)):
+            print(f"{number + 1}: {lines[number]}")
+        break
+```
+
+The gateway Python branch now uses the existing observation truncation
+helper, with launcher default PYTHON_TOOL_RETURN_MAX_CHARS=6000. Full files
+remain available for additional slices. /workspace is a working directory,
+not a filesystem security boundary; Python can still access permitted
+Sandbox system paths. No host shared-storage mount is added.
+
+Live check (qwen-agent must be installed):
+
+```bash
+bash run_sandbox_harness.sh python3 sandbox_smoke.py --page-file --http-url https://r.jina.ai/http://example.com
+```
+
+The isolated rjob preflight includes --page-file before model startup.
+
+Page-file validation: 27 Sandbox regression tests passed. A live test with
+the real Visit and PythonInterpreter tools passed page saving, reading the
+same file from /workspace, repeat-URL cache reuse, 6000-character observation
+truncation, and Sandbox cleanup. Syntax/compileall checks passed. The default
+host lacks pytest; the full Molt pytest suite and full policy rollout have
+not been run for this change.

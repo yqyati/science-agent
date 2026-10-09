@@ -1,0 +1,340 @@
+import ast
+import io
+import json
+import os
+import sys
+import unittest
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Barrier
+from unittest.mock import patch
+from urllib.error import HTTPError
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "inference"))
+
+import sandbox_gateway as gateway
+import sandbox_dns
+import sandbox_http_worker as http_worker
+import sandbox_python_worker as python_worker
+import tool_http_client as transport
+RealGatewayClient = gateway.SandboxGatewayClient
+
+
+class FakeClient:
+    def __init__(self, *_args):
+        self.deleted = []
+        self.uploads = []
+        self.globals = {}
+
+    def create(self, **kwargs):
+        self.create_kwargs = kwargs
+        return "sandbox-1"
+
+    def wait_running(self, *_args):
+        pass
+
+    def upload_file_bytes(self, _sid, path, _data):
+        self.uploads.append(path)
+
+    def command(self, *_args, **_kwargs):
+        return ""
+
+    _shell_quote = staticmethod(gateway.SandboxGatewayClient._shell_quote)
+
+    def proxy_http(self, *_args, **_kwargs):
+        return 200, "ok"
+
+    def proxy_json(self, _sid, port, _path, payload, **_kwargs):
+        if _path == '/prepare-vision':
+            return {'ready': True}
+        if port == 18080:
+            from contextlib import redirect_stdout
+            output = io.StringIO()
+            with redirect_stdout(output):
+                exec(payload["code"], self.globals)
+            return {"stdout": output.getvalue()}
+        return {"status_code": 200, "text": "ok"}
+
+    def delete(self, sid):
+        self.deleted.append(sid)
+
+
+class SandboxTests(unittest.TestCase):
+    def setUp(self):
+        self.env = patch.dict(os.environ, {
+            "OPEN_SANDBOX_GATEWAY_TOKEN": "test-token",
+            "SCIENCE_AGENT_TOOL_HTTP_BACKEND": "gateway_sandbox",
+        })
+        self.env.start()
+        self.client = patch.object(gateway, "SandboxGatewayClient", FakeClient)
+        self.client.start()
+
+    def tearDown(self):
+        gateway.close_shared_sandbox_run()
+        self.client.stop()
+        self.env.stop()
+
+    def test_python_and_http_share_run_and_cleanup_on_error(self):
+        captured = []
+
+        @gateway.sandbox_run_scope
+        def run_agent():
+            run = gateway.shared_sandbox_run()
+            captured.append(run)
+            self.assertEqual(run.run_python("x=40\nprint(x+2)"), "42\n")
+            self.assertEqual(run.run_python("print(x+1)"), "41\n")
+            response = transport.tool_http_request(
+                prefix="JINA", method="GET", url="https://example.com",
+                trace_layer="test", trace_event="test",
+            )
+            self.assertEqual(response.backend, "gateway_sandbox")
+            self.assertEqual(len(run.client.uploads), 3)
+            raise ValueError("test error")
+
+        for _ in range(2):
+            with self.assertRaisesRegex(ValueError, "test error"):
+                run_agent()
+        self.assertIsNot(captured[0], captured[1])
+        for run in captured:
+            self.assertEqual(run.client.deleted, ["sandbox-1"])
+
+    def test_concurrent_agents_have_distinct_runs(self):
+        barrier = Barrier(2)
+
+        @gateway.sandbox_run_scope
+        def run_agent():
+            run = gateway.shared_sandbox_run()
+            barrier.wait(timeout=5)
+            self.assertIs(gateway.shared_sandbox_run(), run)
+            return run
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            runs = list(pool.map(lambda _: run_agent(), range(2)))
+        self.assertIsNot(runs[0], runs[1])
+
+    def test_delete_failure_keeps_id_for_retry(self):
+        run = gateway.shared_sandbox_run()
+        run.ensure()
+        with patch.object(gateway.time, "sleep"), patch.object(run.client, "delete", side_effect=RuntimeError("delete failed")):
+            with self.assertRaises(RuntimeError):
+                run.close()
+        self.assertEqual(run.sandbox_id, "sandbox-1")
+        run.close()
+        self.assertEqual(run.sandbox_id, "")
+
+    def test_agent_cleanup_retries_transient_delete_failure(self):
+        captured = []
+
+        @gateway.sandbox_run_scope
+        def run_agent():
+            run = gateway.shared_sandbox_run()
+            run.ensure()
+            captured.append(run)
+            run.client.delete = unittest.mock.Mock(side_effect=[RuntimeError("temporary"), None])
+
+        with patch.dict(os.environ, {"PYTHON_SESSION_BACKEND": "gateway_sandbox"}), patch.object(gateway.time, "sleep"):
+            run_agent()
+        self.assertEqual(captured[0].client.delete.call_count, 2)
+        self.assertEqual(captured[0].sandbox_id, "")
+
+    def test_disabled_scope_preserves_existing_context(self):
+        existing = gateway.shared_sandbox_run()
+
+        @gateway.sandbox_run_scope
+        def run_agent():
+            return gateway.shared_sandbox_run()
+
+        with patch.dict(os.environ, {"PYTHON_SESSION_BACKEND": "fusion", "SCIENCE_AGENT_TOOL_HTTP_BACKEND": "requests"}):
+            self.assertIs(run_agent(), existing)
+        self.assertEqual(existing.sandbox_id, "")
+
+    def test_startup_failure_deletes_created_instance(self):
+        run = gateway.shared_sandbox_run()
+        with patch.object(FakeClient, "wait_running", side_effect=gateway.SandboxGatewayError("failed startup")):
+            with self.assertRaisesRegex(gateway.SandboxGatewayError, "failed startup"):
+                run.ensure()
+        self.assertEqual(run.client.deleted, ["sandbox-1"])
+        self.assertEqual(run.sandbox_id, "")
+
+    def test_explicit_network_policy_is_sent_on_creation(self):
+        run = gateway.shared_sandbox_run()
+        with patch.dict(os.environ, {"SCIENCE_AGENT_SANDBOX_NETWORK_DEFAULT_ACTION": "allow"}):
+            run.ensure()
+        self.assertEqual(run.client.create_kwargs["network_policy"], {
+            "defaultAction": "deny", "egress": [
+                {"action": "allow", "target": "0.0.0.0/0"},
+                {"action": "allow", "target": "::/0"},
+            ],
+        })
+
+    def test_dns_fallback_verifies_before_writing_and_restores_on_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            resolver = Path(directory) / 'resolv.conf'
+            original = 'search svc.cluster.local\nnameserver 169.254.25.10\noptions ndots:5\n'
+            resolver.write_text(original)
+            with patch.object(sandbox_dns, 'Path', return_value=resolver):
+                with patch.object(sandbox_dns, 'resolver_works', return_value=False):
+                    with self.assertRaisesRegex(RuntimeError, 'No fallback DNS'):
+                        sandbox_dns.configure(['1.1.1.1'])
+                self.assertEqual(resolver.read_text(), original)
+                with patch.object(sandbox_dns, 'resolver_works', return_value=True):
+                    with patch.object(sandbox_dns.socket, 'getaddrinfo', side_effect=OSError('resolution failed')):
+                        with self.assertRaises(OSError):
+                            sandbox_dns.configure(['1.1.1.1'])
+                    self.assertEqual(resolver.read_text(), original)
+                    with patch.object(sandbox_dns.socket, 'getaddrinfo', return_value=[(0, 0, 0, '', ('93.184.215.14', 443))]):
+                        result = sandbox_dns.configure(['1.1.1.1'])
+                self.assertEqual(result['dns_servers'], ['1.1.1.1'])
+                self.assertIn('nameserver 1.1.1.1', resolver.read_text())
+                self.assertIn('search svc.cluster.local', resolver.read_text())
+
+    def test_ca_bundle_is_valid_and_injected_into_sandbox(self):
+        with patch.dict(os.environ, {'SCIENCE_AGENT_SANDBOX_CA_BUNDLE': 'auto'}):
+            bundle = gateway.AgentSandboxRun._ca_bundle()
+            self.assertIn(b'-----BEGIN CERTIFICATE-----', bundle)
+            gateway.ssl.create_default_context(cadata=bundle.decode('ascii'))
+            run = gateway.shared_sandbox_run()
+            run.ensure()
+        self.assertEqual(run.client.create_kwargs['env']['SSL_CERT_FILE'], '/tmp/science-agent-ca.pem')
+        self.assertIn('/tmp/science-agent-ca.pem', run.client.uploads)
+
+    def test_large_upload_is_split_into_bounded_commands(self):
+        client = object.__new__(RealGatewayClient)
+        with patch.object(client, 'command') as command:
+            client.upload_file_bytes('test', '/tmp/ca.pem', b'x' * (200 * 1024))
+        self.assertEqual(command.call_count, 5)
+        calls = [call.args[1] for call in command.call_args_list]
+        self.assertTrue(all(len(text) < 70000 for text in calls))
+        self.assertIn(' > ', calls[0])
+        self.assertTrue(all(' >> ' in text for text in calls[1:]))
+
+    def test_visual_worker_returns_crop_plot_and_persistent_state(self):
+        import base64
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'input.png'
+            Image.new('RGB', (20, 16), 'red').save(path)
+            data = python_worker.execute_payload({'visual': True, 'code':
+                'from PIL import Image\n'
+                f'img = Image.open({str(path)!r})\n'
+                'display(img.crop((0,0,5,6)))\n'
+                'import matplotlib.pyplot as plt\nplt.plot([1,2],[3,4])\nplt.show()\n'
+                'print("visual_measurement_summary: crop 5x6")'})
+            self.assertEqual(data['error'], '')
+            self.assertEqual(len(data['images']), 2)
+            crop = Image.open(io.BytesIO(base64.b64decode(data['images'][0]['data'])))
+            self.assertEqual(crop.size, (5,6))
+            self.assertIn('crop 5x6', data['stdout'])
+            subsequent = python_worker.execute_payload({'code': 'print(img.size)'})
+            self.assertEqual(subsequent['stdout'], '(20, 16)\n')
+            tail = python_worker.execute_payload({'visual': True, 'code': 'img.crop((0,0,2,3))'})
+            self.assertEqual(len(tail['images']), 1)
+
+    def test_visual_upload_deduplicates_within_run(self):
+        import base64
+        files = {'input_images/test.png': base64.b64encode(b'image').decode()}
+        run = gateway.shared_sandbox_run()
+        run.run_visual('print(1)', files)
+        run.run_visual('print(2)', files)
+        self.assertEqual(run.client.uploads.count('/workspace/input_images/test.png'), 1)
+        with self.assertRaises(gateway.SandboxGatewayError):
+            run.run_visual('print(3)', {'../outside.png': files['input_images/test.png']})
+
+    def test_vision_installs_only_missing_packages_and_checks_errors(self):
+        from types import SimpleNamespace
+        with patch.object(python_worker.importlib.util, 'find_spec', side_effect=lambda name: None if name == 'matplotlib' else object()):
+            with patch.object(python_worker.importlib, 'import_module'):
+                with patch.object(python_worker.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as install:
+                    result = python_worker.prepare_vision({'install': True})
+                    self.assertTrue(result['ready'])
+                    self.assertEqual(result['installed'], ['matplotlib'])
+                    self.assertEqual(install.call_args.args[0][-1], 'matplotlib')
+                with patch.object(python_worker.subprocess, 'run', return_value=SimpleNamespace(returncode=1, stderr='download failed', stdout='')):
+                    self.assertIn('download failed', python_worker.prepare_vision({'install': True})['error'])
+            with patch.object(python_worker.subprocess, 'run') as install:
+                self.assertIn('Missing Vision dependencies', python_worker.prepare_vision({'install': False})['error'])
+                install.assert_not_called()
+
+    def test_http_worker_preserves_upstream_status_and_body(self):
+        handler = object.__new__(http_worker.Handler)
+        handler.path = "/request"
+        payload = json.dumps({"url": "https://example.com"}).encode()
+        handler.headers = {"Content-Length": str(len(payload))}
+        handler.rfile, handler.wfile = io.BytesIO(payload), io.BytesIO()
+        handler.send_response = lambda *_: None
+        handler.send_header = lambda *_: None
+        handler.end_headers = lambda: None
+        handler.send_error = lambda *args: self.fail(str(args))
+        error = HTTPError("https://example.com", 429, "rate limited", {}, io.BytesIO(b'{"error":"rate limited"}'))
+        with patch.object(http_worker, "urlopen", side_effect=error):
+            handler.do_POST()
+        result = json.loads(handler.wfile.getvalue())
+        self.assertEqual(result["status_code"], 429)
+        self.assertEqual(result["text"], '{"error":"rate limited"}')
+
+    def test_readpage_summary_uses_sandbox_transport(self):
+        # Extract the actual method to avoid optional qwen_agent dependencies.
+        source = Path(__file__).resolve().parents[1] / "inference/tool_visit_mcp_r1.py"
+        tree = ast.parse(source.read_text())
+        method = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "call_server")
+        namespace = {
+            "os": os, "json": json, "time": __import__("time"),
+            "SUMMARY_REQUEST_TIMEOUT_SEC": 30, "SUMMARY_RETRY_SLEEP_SEC": 0,
+            "SUMMARY_CACHE_FILE": "unused", "successful_calls_summarize": 0,
+            "failed_calls_summarize": 0, "emit_trace": lambda *a, **k: None,
+            "is_text_blocked": lambda *a, **k: False,
+            "write_cache_log": lambda *a: None,
+            "OpenAI": lambda **k: self.fail("host LLM used"),
+        }
+        calls = []
+
+        def request(**kwargs):
+            calls.append(kwargs)
+            return transport.ToolHttpResponse(200, json.dumps({"choices": [{"message": {"content": '{"summary":"ok"}'}}]}), "gateway_sandbox", 0)
+
+        namespace["tool_http_request"] = request
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), namespace)
+        with patch.dict(os.environ, {"API_BASE": "http://llm/v1", "API_KEY": "test", "SUMMARY_MODEL_NAME": "test-model"}):
+            result = namespace["call_server"](None, [{"role": "user", "content": "Summarize"}])
+        self.assertEqual(json.loads(result)["summary"], "ok")
+        self.assertEqual(calls[0]["url"], "http://llm/v1/chat/completions")
+        self.assertEqual(calls[0]["json_payload"]["model"], "test-model")
+
+        # The existing host SDK route still handles non-gateway mode.
+        from types import SimpleNamespace
+        sdk_calls = []
+
+        def sdk_create(**kwargs):
+            sdk_calls.append(kwargs)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"summary":"host"}'))])
+
+        namespace["OpenAI"] = lambda **kwargs: SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=sdk_create)))
+        namespace["httpx"] = SimpleNamespace(Client=lambda **kwargs: None)
+        with patch.dict(os.environ, {"SCIENCE_AGENT_TOOL_HTTP_BACKEND": "requests", "SUMMARY_MODEL_NAME": "host-model"}):
+            result = namespace["call_server"](None, [{"role": "user", "content": "Summarize"}])
+        self.assertEqual(json.loads(result)["summary"], "host")
+        self.assertEqual(sdk_calls[0]["model"], "host-model")
+        self.assertEqual(len(calls), 1)
+
+    def test_extractive_visit_skips_tokenizer_and_summary(self):
+        from types import SimpleNamespace
+        source = Path(__file__).resolve().parents[1] / 'inference/tool_visit_mcp_r1.py'
+        tree = ast.parse(source.read_text())
+        method = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == 'readpage_jina')
+        namespace = {
+            'os': os, 'time': __import__('time'), 'VISIT_SERVER_MAX_RETRIES': 1,
+            'emit_trace': lambda *a, **k: None,
+            '_is_blocked_visit_response': lambda *a: False,
+            'is_text_blocked': lambda *a, **k: False,
+            '_extractive_visit_return': lambda url, goal, content: 'evidence: ' + content,
+            'truncate_to_tokens': lambda *a, **k: self.fail('tokenizer called'),
+        }
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'), namespace)
+        tool = SimpleNamespace(html_readpage_jina=lambda url: 'page text', call_server=lambda *a, **k: self.fail('summary called'))
+        with patch.dict(os.environ, {'SCIENCE_AGENT_READ_PAGE_MODE': 'extractive'}):
+            self.assertEqual(namespace['readpage_jina'](tool, 'https://example.com', 'goal'), 'evidence: page text')
+
+
+if __name__ == "__main__":
+    unittest.main()
