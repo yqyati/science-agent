@@ -52,11 +52,15 @@ class PageTests(unittest.TestCase):
             result = self.request()
             page = result["page"]
             self.assertEqual(Path(page["path"]).read_text(), text)
-            self.assertEqual(Path(page["absolute_path"]).read_text(), text)
+            self.assertNotIn("absolute_path", page)
+            self.assertFalse(Path(page["path"]).is_absolute())
             self.assertEqual(page["lines"], len(text.splitlines()))
             self.assertLess(len(json.dumps(result)), 2500)
             self.assertNotIn("text", result)
+            source = Path(page["path"]).with_name("source.json")
+            source.write_text(json.dumps(dict(page, absolute_path=str(Path(page["path"]).resolve()))))
             cached = self.request()
+            self.assertNotIn("absolute_path", cached["page"])
             self.assertTrue(cached["page"]["cached"])
             fetch.assert_called_once()
         other = dict(self.payload, source_url="https://source/other")
@@ -80,7 +84,7 @@ class PageTests(unittest.TestCase):
         source = ROOT / "inference/tool_visit_mcp_r1.py"
         tree = ast.parse(source.read_text())
         method = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "readpage_jina")
-        page = {"path": "pages/test/content.md", "characters": 50000}
+        page = {"path": "pages/test/content.md", "absolute_path": "/workspace/pages/test/content.md", "characters": 50000}
         calls = []
         def run_http(payload, **kwargs):
             calls.append(payload)
@@ -96,6 +100,8 @@ class PageTests(unittest.TestCase):
         with patch.dict(os.environ, {"SCIENCE_AGENT_READ_PAGE_MODE": "file", "SCIENCE_AGENT_TOOL_HTTP_BACKEND": "gateway_sandbox"}):
             result = json.loads(namespace["readpage_jina"](agent, "https://source/test", "find evidence"))
         self.assertEqual(result["path"], page["path"])
+        self.assertNotIn("absolute_path", result)
+        self.assertIn("do not prepend /workspace", result["instruction"])
         self.assertTrue(calls[0]["save_page"])
         self.assertIn("guard_snapshot", calls[0])
         self.assertNotIn("tiktoken", source.read_text())

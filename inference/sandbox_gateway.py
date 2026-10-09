@@ -46,15 +46,26 @@ class SandboxGatewayClient:
             request_headers["Content-Type"] = "application/json"
         request_headers.update(headers or {})
         request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
-        try:
-            with urllib.request.urlopen(request, timeout=180) as response:
-                raw = response.read()
-                return json.loads(raw.decode("utf-8")) if raw else None
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:1000]
-            raise SandboxGatewayError(f"HTTP {exc.code} {method} {path}: {detail}") from exc
-        except (urllib.error.URLError, TimeoutError) as exc:
-            raise SandboxGatewayError(f"gateway request failed {method} {path}: {exc}") from exc
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(request, timeout=180) as response:
+                    raw = response.read()
+                    return json.loads(raw.decode("utf-8")) if raw else None
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")[:1000]
+                # GET cannot execute Agent code; retry transient authorization
+                # and gateway failures without replaying create/command requests.
+                if method == "GET" and exc.code in {403, 502, 503, 504} and attempt < 2:
+                    logging.getLogger(__name__).warning("Gateway GET retry path=%s status=%d attempt=%d/3", path, exc.code, attempt + 1)
+                    time.sleep(attempt + 1)
+                    continue
+                raise SandboxGatewayError(f"HTTP {exc.code} {method} {path} (attempt {attempt + 1}/3): {detail}") from exc
+            except (urllib.error.URLError, TimeoutError) as exc:
+                if method == "GET" and attempt < 2:
+                    logging.getLogger(__name__).warning("Gateway GET retry path=%s error=%s attempt=%d/3", path, type(exc).__name__, attempt + 1)
+                    time.sleep(attempt + 1)
+                    continue
+                raise SandboxGatewayError(f"gateway request failed {method} {path}: {exc}") from exc
 
     def create(self, *, image: str, entrypoint: list[str] | None = None, cpu: str = "2", memory: str = "4Gi", timeout: int = 1800, env: dict[str, str] | None = None, network_policy: dict[str, Any] | None = None) -> str:
         payload: dict[str, Any] = {
@@ -153,12 +164,19 @@ class SandboxGatewayClient:
         request_headers = dict(headers)
         request_headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url + "/" + path.lstrip("/"), data=json.dumps(payload).encode("utf-8"), headers=request_headers, method="POST")
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:1000]
-            raise SandboxGatewayError(f"proxy HTTP {exc.code}: {detail}") from exc
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")[:1000]
+                # Only retry an explicit gateway connection failure, which
+                # occurs before the worker accepts code. Timeouts are ambiguous.
+                if exc.code == 502 and "Sandbox upstream connection failed" in detail and attempt < 2:
+                    logging.getLogger(__name__).warning("Sandbox connection retry id=%s port=%d attempt=%d/3", sandbox_id, port, attempt + 1)
+                    time.sleep(attempt + 1)
+                    continue
+                raise SandboxGatewayError(f"proxy HTTP {exc.code} (attempt {attempt + 1}/3): {detail}") from exc
 
     def proxy_http(self, sandbox_id: str, port: int, path: str, *, method: str = "GET", headers: dict[str, str] | None = None, body: bytes | None = None, timeout: int = 180) -> tuple[int, str]:
         url, endpoint_headers = self.endpoint(sandbox_id, port)

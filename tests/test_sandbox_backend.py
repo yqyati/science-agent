@@ -138,6 +138,66 @@ class SandboxTests(unittest.TestCase):
         self.assertEqual(captured[0].client.delete.call_count, 2)
         self.assertEqual(captured[0].sandbox_id, "")
 
+    def test_gateway_lookup_retries_403_and_returns_recovered_response(self):
+        client = RealGatewayClient("http://gateway", "test-token")
+        error = HTTPError("http://gateway", 403, "Forbidden", {}, io.BytesIO(b"awaiting authorization"))
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"endpoint":"http://worker"}'
+        with patch.object(gateway.urllib.request, "urlopen", side_effect=[error, response]) as request, patch.object(gateway.time, "sleep"):
+            self.assertEqual(client.endpoint("sid")[0], "http://worker")
+            self.assertEqual(request.call_count, 2)
+
+    def test_gateway_lookup_reports_error_only_after_three_failures(self):
+        client = RealGatewayClient("http://gateway", "test-token")
+        errors = [HTTPError("http://gateway", 403, "Forbidden", {}, io.BytesIO(b"awaiting authorization")) for _ in range(3)]
+        with patch.object(gateway.urllib.request, "urlopen", side_effect=errors) as request, patch.object(gateway.time, "sleep"):
+            with self.assertRaisesRegex(gateway.SandboxGatewayError, "attempt 3/3"):
+                client.endpoint("sid")
+            self.assertEqual(request.call_count, 3)
+
+    def test_python_proxy_retries_connection_failure_but_not_execution_timeout(self):
+        client = RealGatewayClient("http://gateway", "test-token")
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"stdout":"executed once"}'
+        errors = [HTTPError("http://worker", 502, "Bad Gateway", {}, io.BytesIO(b"Sandbox upstream connection failed")) for _ in range(2)]
+        with patch.object(client, "endpoint", return_value=("http://worker", {})), patch.object(gateway.time, "sleep"):
+            with patch.object(gateway.urllib.request, "urlopen", side_effect=errors + [response]) as request:
+                self.assertEqual(client.proxy_json("sid", 18080, "/execute", {"code":"print(1)"})["stdout"], "executed once")
+                self.assertEqual(request.call_count, 3)
+            with patch.object(gateway.urllib.request, "urlopen", side_effect=TimeoutError("response timed out")) as request:
+                with self.assertRaises(TimeoutError):
+                    client.proxy_json("sid", 18080, "/execute", {"code":"print(1)"})
+                self.assertEqual(request.call_count, 1)
+            error = HTTPError("http://worker", 502, "Bad Gateway", {}, io.BytesIO(b"worker response interrupted"))
+            with patch.object(gateway.urllib.request, "urlopen", side_effect=error) as request:
+                with self.assertRaises(gateway.SandboxGatewayError):
+                    client.proxy_json("sid", 18080, "/execute", {"code":"print(1)"})
+                self.assertEqual(request.call_count, 1)
+
+    def test_agent_finish_marks_budget_and_rejects_placeholder(self):
+        from types import SimpleNamespace
+        source = Path(__file__).resolve().parents[1] / "inference/react_agent_qwen_api.py"
+        tree = ast.parse(source.read_text())
+        finish = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "finish")
+        namespace = {
+            "response_was_truncated": False, "trajectory_budget_exhausted": True,
+            "usage_totals": {}, "has_usage": False,
+            "self": SimpleNamespace(_attach_usage_fields=lambda result, *args: result),
+        }
+        exec(compile(ast.Module(body=[finish], type_ignores=[]), str(source), "exec"), namespace)
+        result = namespace["finish"]({"prediction": "Your Answer", "termination": "old"})
+        self.assertEqual(result["prediction"], "")
+        self.assertTrue(result["truncated"])
+        self.assertFalse(result["generation_truncated"])
+        self.assertFalse(result["final_answer_valid"])
+        result = namespace["finish"]({"prediction": "32", "termination": "finalized"})
+        self.assertEqual(result["prediction"], "32")
+        self.assertEqual(result["termination"], "finalized")
+        self.assertTrue(result["final_answer_valid"])
+        namespace["trajectory_budget_exhausted"] = False
+        result = namespace["finish"]({"prediction": "32"})
+        self.assertFalse(result["truncated"])
+
     def test_disabled_scope_preserves_existing_context(self):
         existing = gateway.shared_sandbox_run()
 

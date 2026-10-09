@@ -27,7 +27,6 @@ def save_page(payload, text):
     folder.mkdir(parents=True, exist_ok=True)
     metadata = {
         "page_id": page_id, "path": str(folder / "content.md"),
-        "absolute_path": str((folder / "content.md").resolve()),
         "source_url": payload["source_url"], "reader_url": payload["url"],
         "format": "markdown", "characters": len(text), "lines": len(text.splitlines()),
         "fetched_at": time.time(), "preview": text[:1000],
@@ -77,6 +76,7 @@ class Handler(BaseHTTPRequestHandler):
                     if (folder / "source.json").is_file() and (folder / "content.md").is_file() and (folder / "content.md").stat().st_size:
                         cached = json.loads((folder / "source.json").read_text(encoding="utf-8"))
                     if cached and cached["guard_fingerprint"] == payload["guard_fingerprint"]:
+                        cached.pop("absolute_path", None)
                         result = {"status_code": 200, "page": dict(cached, cached=True)}
                     else:
                         request = Request(url, headers=headers, method="GET")

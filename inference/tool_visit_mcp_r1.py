@@ -255,10 +255,12 @@ class Visit(BaseTool):
     name = 'read-page-server-read_page'
     description = (
         "Fetch a known webpage URL after search or when a URL is given. In Sandbox file mode, "
-        "save the complete reader-provided Markdown in this Agent's /workspace/pages directory. "
+        "save the complete reader-provided Markdown under pages/ in this Agent's working directory. "
         "Return the file path, source URL, character/line counts, and a short preview; "
         "the response is not the full page and no LLM summary is generated. "
-        "Next use the Python tool to read the returned relative path from /workspace with UTF-8. "
+        "Python already starts in /workspace. Pass the returned path directly to open() or Path().read_text() "
+        "with UTF-8; for example, Path('pages/<page_id>/content.md').read_text(encoding='utf-8'). "
+        "Do not prepend /workspace or use an absolute path; the Python tool requires relative paths. "
         "Search for relevant terms or inspect line ranges, and print original evidence with line numbers "
         "and surrounding context. Do not assume information absent from the preview is absent from the page. "
         "Keep each Python output short; if it reports truncation, read smaller ranges to recover omitted evidence. "
@@ -597,12 +599,13 @@ class Visit(BaseTool):
                         "guard_fingerprint": guard_fingerprint(context),
                     }, timeout=tool_http_config("JINA")["max_time"])
                     if result["status_code"] == 200:
-                        page = result["page"]
+                        page = dict(result["page"])
+                        page.pop("absolute_path", None)
                         if page.get("blocked"):
                             return blocked_visit_message()
                         emit_trace("read_page_saved", layer="tool_visit", url=url,
                                    path=page["path"], page_chars=page["characters"], cached=page.get("cached", False))
-                        return json.dumps(dict(page, instruction="This is a file description and preview, not the full page. Use Python to read the relative path from /workspace with UTF-8. Print relevant original lines with line numbers and context. If output is truncated, read smaller line ranges."), ensure_ascii=False)
+                        return json.dumps(dict(page, instruction="This is a file description and preview, not the full page. Python already starts in /workspace. Read path exactly as returned with UTF-8; do not prepend /workspace or use absolute paths. Print relevant original lines with line numbers and context. If output is truncated, read smaller line ranges."), ensure_ascii=False)
                     error = f"HTTP {result['status_code']}: {result.get('text', '')[:500]}"
                 except Exception as exc:
                     error = str(exc)

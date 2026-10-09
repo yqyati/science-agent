@@ -119,6 +119,37 @@ class JudgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.reward, 1)
         self.factory.assert_not_called()
 
+    async def test_budget_exhausted_placeholder_skips_judge_and_marks_truncated(self):
+        self.namespace["MultiTurnReactAgent"] = lambda **kw: SimpleNamespace(_run=lambda *args: {
+            "prediction": "your answer", "trajectory_budget_exhausted": True, "generation_truncated": False})
+        result = await self.agent.run(context())
+        self.assertEqual(result.reward, 0)
+        self.assertTrue(result.truncated)
+        self.assertEqual(result.info["science_prediction"], "")
+        self.assertEqual(result.info["science_final_answer_valid"], 0)
+        self.assertEqual(result.info["science_generation_truncated"], 0)
+        self.assertEqual(result.info["science_trajectory_budget_exhausted"], 1)
+        self.assertEqual(result.info["science_termination"], "trajectory budget exhausted without valid final answer")
+        self.factory.assert_not_called()
+
+    async def test_budget_exhausted_real_answer_is_graded(self):
+        self.namespace["MultiTurnReactAgent"] = lambda **kw: SimpleNamespace(_run=lambda *args: {
+            "prediction": "5003", "trajectory_budget_exhausted": True, "generation_truncated": False})
+        result = await self.agent.run(context())
+        self.assertEqual(result.reward, 1)
+        self.assertTrue(result.truncated)
+        self.assertEqual(result.info["science_final_answer_valid"], 1)
+        self.run.run_http.assert_called_once()
+
+    async def test_generation_truncation_is_distinct_from_budget_exhaustion(self):
+        self.namespace["MultiTurnReactAgent"] = lambda **kw: SimpleNamespace(_run=lambda *args: {
+            "prediction": "5003", "generation_truncated": True, "trajectory_budget_exhausted": False})
+        with patch.dict(os.environ, {"SCIENCE_AGENT_REWARD_MODE": "f1"}):
+            result = await self.agent.run(context())
+        self.assertTrue(result.truncated)
+        self.assertEqual(result.info["science_generation_truncated"], 1)
+        self.assertEqual(result.info["science_trajectory_budget_exhausted"], 0)
+
     async def test_cancel_waits_for_inflight_request_before_cleanup(self):
         started, release = Event(), Event()
 

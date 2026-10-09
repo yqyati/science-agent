@@ -126,7 +126,8 @@ def main():
             tool = Visit()
             url = "http://example.com"
             metadata = json.loads(tool.call({"url": url, "goal": "Find the page title"}))
-            assert metadata["absolute_path"].startswith("/workspace/pages/")
+            assert "absolute_path" not in metadata
+            assert metadata["path"].startswith("pages/") and not Path(metadata["path"]).is_absolute()
             path = metadata["path"]
             output = run.run_python("import os\nfrom pathlib import Path\nassert os.getcwd() == '/workspace'\n" +
                                     "text = Path(" + repr(path) + ").read_text(encoding='utf-8')\n" +

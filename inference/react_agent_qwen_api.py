@@ -1374,6 +1374,15 @@ class MultiTurnReactAgent(FnCallAgent):
         reasoning = self._extract_reasoning(response_message)
         content = safe_strip(getattr(response_message, "content", ""))
         if not self._deepseek_v4_response_enabled():
+            model_names = f"{self.llm_local_path} {self.served_model_name}".lower()
+            if AGENT_OBSERVATION_MASKING and "qwen" in model_names:
+                # Molt decodes raw completion tokens; framing belongs to the
+                # chat template, not to the replayed assistant body.
+                content = re.sub(r"(?:\s*<\|(?:im_end|endoftext)\|>)+\s*$", "", content).strip()
+                if not reasoning and "</think>" in content:
+                    reasoning, content = content.split("</think>", 1)
+                    reasoning = reasoning.removeprefix("<think>").strip()
+                    content = content.strip()
             return reasoning, content
 
         split_fields = split_deepseek_v4_response_text(content, reasoning)
@@ -2810,7 +2819,8 @@ class MultiTurnReactAgent(FnCallAgent):
         }
         # Some OpenAI-compatible thinking endpoints require the exact
         # `reasoning_content` key when replaying an assistant tool-call turn.
-        message["reasoning_content"] = reasoning or ""
+        if not AGENT_OBSERVATION_MASKING or reasoning or self._deepseek_v4_response_enabled():
+            message["reasoning_content"] = reasoning or ""
         if isinstance(response_output_items, list) and response_output_items:
             message["_responses_output"] = copy.deepcopy(response_output_items)
         return message
@@ -3227,11 +3237,21 @@ class MultiTurnReactAgent(FnCallAgent):
         prediction = None
         termination = None
         response_was_truncated = False
+        trajectory_budget_exhausted = False
         usage_totals: dict[str, int] = {}
         has_usage = False
 
         def finish(result: dict) -> dict:
-            result["truncated"] = response_was_truncated
+            prediction = str(result.get("prediction") or "").strip()
+            if prediction.casefold() in {"your answer", "your final answer"}:
+                prediction = ""
+            result["prediction"] = prediction
+            result["generation_truncated"] = response_was_truncated
+            result["trajectory_budget_exhausted"] = trajectory_budget_exhausted
+            result["final_answer_valid"] = bool(prediction)
+            result["truncated"] = response_was_truncated or trajectory_budget_exhausted
+            if trajectory_budget_exhausted and not prediction:
+                result["termination"] = "trajectory budget exhausted without valid final answer"
             return self._attach_usage_fields(result, usage_totals, has_usage)
 
         while num_llm_calls_available > 0:
@@ -3457,6 +3477,7 @@ class MultiTurnReactAgent(FnCallAgent):
 
             if token_count > max_tokens:
                 if CONTEXT_MANAGEMENT_STRATEGY == "none":
+                    trajectory_budget_exhausted = True
                     terminal_print(f"Warning: token quantity exceeds the limit: {token_count} > {max_tokens}")
 
                     if AGENT_EVAL_FORCE_FINALIZE:
@@ -3497,8 +3518,8 @@ class MultiTurnReactAgent(FnCallAgent):
                         "You have now reached the maximum context length you can handle. "
                         "You should stop making tool calls and, based on all the "
                         "information above, think again and provide what you consider "
-                        "the most likely answer in the following format:<think>your "
-                        "final thinking</think>\n<answer>your answer</answer>"
+                        "the most likely actual answer enclosed in <answer> and </answer> tags. "
+                        "Do not copy template placeholders or make further tool calls."
                     )
                     passin_messages[-1]["content"] = messages[-1]["content"]
                     self._set_fallback_message_lists(messages, passin_messages)
@@ -3509,6 +3530,7 @@ class MultiTurnReactAgent(FnCallAgent):
                     )
                     has_usage = merge_usage_dict(usage_totals, usage) or has_usage
                     reasoning, content = self._extract_response_text_fields(choice)
+                    response_was_truncated = response_was_truncated or bool(getattr(choice, "_molt_truncated", False))
                     tool_calls = getattr(choice, "tool_calls", None)
                     serialized_tool_calls = (
                         [

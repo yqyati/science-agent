@@ -247,3 +247,33 @@ same file from /workspace, repeat-URL cache reuse, 6000-character observation
 truncation, and Sandbox cleanup. Syntax/compileall checks passed. The default
 host lacks pytest; the full Molt pytest suite and full policy rollout have
 not been run for this change.
+
+Path protocol: page metadata exposes only the relative `path`, for example
+`pages/<page_id>/content.md`. Python already runs in /workspace; pass `path`
+directly to open() or Path().read_text(), without prepending /workspace.
+Absolute paths are rejected by the existing Python path policy. Cached
+metadata from older workers also has absolute_path removed before return.
+
+Infrastructure retries: gateway GET lookups retry HTTP 403/502/503/504 and
+transport errors up to three attempts, with 1s/2s waits. Worker proxy calls
+retry only the explicit 502 "Sandbox upstream connection failed" response.
+Recovery returns the normal tool result; exhausted retries return an error.
+Python execution response timeouts and generic 502 errors are not replayed
+because the worker may already have executed stateful code.
+
+Budget termination: Agent results distinguish generation_truncated from
+trajectory_budget_exhausted and propagate their OR through Result.truncated
+in the isolated Molt adapter, allowing session capture to mark the final
+trajectory segment. Both flags and science_final_answer_valid are included
+in eval trace info. Here valid means a nonempty candidate that is not an
+exact template placeholder, not judge correctness. Budget finalization no
+longer includes a literal placeholder answer. Empty/placeholder answers
+are skipped by judge with reward 0 and explicit budget termination; real
+answers produced at the limit remain eligible for grading. Existing Molt
+truncated_rate still averages trajectory segments; the reason flags provide
+episode diagnosis without changing that metric's definition.
+
+Validation: 34 Sandbox tests passed, including budget placeholder rejection,
+real-answer grading after budget exhaustion, and propagation through judge,
+empty-answer, and F1 branches. Molt compileall passed; its full pytest suite
+could not run because pytest is absent on this host.
