@@ -7,7 +7,9 @@ protocol so the harness can select either backend explicitly.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import inspect
 import json
 import logging
 import os
@@ -464,12 +466,27 @@ def close_shared_sandbox_run() -> None:
 
 def sandbox_run_scope(function):
     """Give each gateway-enabled Agent invocation a fresh run and cleanup."""
+    if inspect.iscoroutinefunction(function):
+        @wraps(function)
+        async def async_wrapped(*args, **kwargs):
+            run = AgentSandboxRun()
+            token = _SHARED_RUN.set(run)
+            try:
+                return await function(*args, **kwargs)
+            finally:
+                try:
+                    await asyncio.to_thread(run.close)
+                finally:
+                    _SHARED_RUN.reset(token)
+        return async_wrapped
+
     @wraps(function)
     def wrapped(*args, **kwargs):
         enabled = any(os.getenv(name, "").strip().lower() == "gateway_sandbox" for name in (
             "PYTHON_SESSION_BACKEND", "SCIENCE_AGENT_TOOL_HTTP_BACKEND",
         ))
-        if not enabled:
+        # The outer task may own cleanup until post-generation judging ends.
+        if not enabled or _SHARED_RUN.get() is not None:
             return function(*args, **kwargs)
         run = AgentSandboxRun()
         token = _SHARED_RUN.set(run)

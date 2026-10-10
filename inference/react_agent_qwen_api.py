@@ -2773,8 +2773,10 @@ class MultiTurnReactAgent(FnCallAgent):
         remaining = max(0, TRAJECTORY_MAX_TOKENS - used_tokens)
         notice = (
             "\n\n[Budget] Approximately "
-            f"{remaining} tokens remain in the total trajectory budget. "
-            "Keep the next response concise and provide the final answer before the budget is exhausted."
+            f"{remaining} tokens remain in the current context budget. "
+            "Further reasoning, tool calls, and tool results all consume this budget. "
+            "This estimate does not reserve tokens for the final answer. "
+            "When the remaining budget is insufficient, stop calling tools and provide the final answer."
         )
         if isinstance(content, str):
             return content + notice

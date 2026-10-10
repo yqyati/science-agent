@@ -1,4 +1,5 @@
 import ast
+import asyncio
 import io
 import json
 import os
@@ -112,6 +113,108 @@ class SandboxTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as pool:
             runs = list(pool.map(lambda _: run_agent(), range(2)))
         self.assertIsNot(runs[0], runs[1])
+
+    def test_async_task_reuses_tool_sandbox_for_judge_and_cleans_up(self):
+        captured = []
+
+        @gateway.sandbox_run_scope
+        def run_tools():
+            run = gateway.shared_sandbox_run()
+            run.run_python("print(42)")
+            return run
+
+        @gateway.sandbox_run_scope
+        async def run_task(fail):
+            run = await asyncio.to_thread(run_tools)
+            captured.append(run)
+            self.assertIs(run, gateway.shared_sandbox_run())
+            self.assertEqual(run.client.deleted, [])
+            await asyncio.to_thread(run.run_http, {"url": "https://judge"})
+            self.assertEqual(run.client.deleted, [])
+            if fail:
+                raise ValueError("judge failure")
+
+        asyncio.run(run_task(False))
+        with self.assertRaisesRegex(ValueError, "judge failure"):
+            asyncio.run(run_task(True))
+        self.assertIsNot(captured[0], captured[1])
+        for run in captured:
+            self.assertEqual(run.client.deleted, ["sandbox-1"])
+        self.assertIsNone(gateway._SHARED_RUN.get())
+
+    def test_concurrent_async_tasks_keep_distinct_sandboxes(self):
+        barrier = Barrier(2)
+
+        @gateway.sandbox_run_scope
+        def run_tools():
+            run = gateway.shared_sandbox_run()
+            run.ensure()
+            barrier.wait(timeout=5)
+            return run
+
+        @gateway.sandbox_run_scope
+        async def run_task():
+            run = await asyncio.to_thread(run_tools)
+            self.assertIs(run, gateway.shared_sandbox_run())
+            return run
+
+        async def run_both():
+            return await asyncio.gather(run_task(), run_task())
+
+        runs = asyncio.run(run_both())
+        self.assertIsNot(runs[0], runs[1])
+        for run in runs:
+            self.assertEqual(run.client.deleted, ["sandbox-1"])
+
+    def test_molt_adapter_keeps_sandbox_until_judge_finishes(self):
+        from types import SimpleNamespace
+        source = Path(__file__).resolve().parents[3] / "labs-molt/examples/python/agents/science_legacy_react_sandbox.py"
+        if not source.is_file():
+            self.skipTest("Molt adapter integration requires the sibling labs-molt checkout")
+        tree = ast.parse(source.read_text())
+        agent_class = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ScienceLegacyReactAgent")
+        method = agent_class.body[0]
+        captured = []
+
+        class ToolAgent:
+            def __init__(self, **kwargs):
+                pass
+
+            @gateway.sandbox_run_scope
+            def _run(self, *args):
+                run = gateway.shared_sandbox_run()
+                captured.append(run)
+                run.run_python("print(42)")
+                return {"prediction": "42", "messages": []}
+
+        def judge(run, payload, **kwargs):
+            self.assertIs(run, captured[-1])
+            self.assertEqual(run.client.deleted, [])
+            self.assertEqual(payload["json"]["model"], "test-judge")
+            return {"status_code": 200, "text": json.dumps({"choices": [{"message": {
+                "content": '{"score": 1, "correct": true}',
+            }, "finish_reason": "stop"}]})}
+
+        namespace = {
+            "sandbox_run_scope": gateway.sandbox_run_scope,
+            "shared_sandbox_run": gateway.shared_sandbox_run,
+            "asyncio": asyncio, "os": os, "json": json,
+            "ChatContext": object, "Result": lambda **kwargs: SimpleNamespace(**kwargs),
+            "MultiTurnReactAgent": ToolAgent, "SCIENCE_AGENT_ROOT": source.parent,
+            "_text": lambda value: "" if value is None else str(value),
+            "torch": SimpleNamespace(tensor=lambda value, **kwargs: value, float32=None),
+        }
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), namespace)
+        ctx = SimpleNamespace(label={"answer": "42"}, model_name="test-policy", base_url="http://policy",
+                              api_key="test-key", prompt="Question", messages=[], sampling_params=None)
+        with patch.dict(os.environ, {"SCIENCE_AGENT_JUDGE_BASE_URL": "http://judge/v1",
+                                     "SCIENCE_AGENT_JUDGE_MODEL": "test-judge", "API_KEY": "test-key",
+                                     "SCIENCE_AGENT_REWARD_MODE": "judge", "SCIENCE_AGENT_NEXT_HLE_EVAL_PROTOCOL": "0"}):
+            with patch.object(gateway.AgentSandboxRun, "run_http", judge):
+                result = asyncio.run(namespace["run"](None, ctx))
+        self.assertEqual(result.reward, 1.0)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].client.deleted, ["sandbox-1"])
 
     def test_delete_failure_keeps_id_for_retry(self):
         run = gateway.shared_sandbox_run()
