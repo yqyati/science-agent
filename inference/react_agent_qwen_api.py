@@ -7,6 +7,7 @@ import re
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
@@ -654,7 +655,16 @@ def _json_for_token_estimate(payload) -> str:
 
 
 def estimate_request_input_tokens(messages, tool_schemas=None) -> int:
-    payload = {"messages": messages}
+    # Image transport bytes are not text tokens. Keep only a placeholder in
+    # this text estimate; count_tokens adds processor-derived vision tokens.
+    payload = {"messages": copy.deepcopy(messages)}
+    for message in payload["messages"]:
+        if isinstance(message.get("content"), list):
+            message["content"] = [
+                {"type": "image_url", "image_url": {"url": "<image>"}}
+                if isinstance(part, dict) and part.get("type") == "image_url" else part
+                for part in message["content"]
+            ]
     if tool_schemas:
         payload["tools"] = tool_schemas
 
@@ -1165,6 +1175,8 @@ class MultiTurnReactAgent(FnCallAgent):
         self._fallback_message_lists = []
         self._context_tokenizer = None
         self._context_tokenizer_unavailable = False
+        self._context_processor = None
+        self._context_image_tokens = {}
 
     def _infer_tool_status(self, tool_response: str) -> str:
         text = (tool_response or "").lower()
@@ -2157,7 +2169,7 @@ class MultiTurnReactAgent(FnCallAgent):
             request_tool_schemas,
             openai_api_base,
         )
-        local_input_tokens = estimate_request_input_tokens(msgs, request_tool_schemas)
+        local_input_tokens = self.count_tokens(msgs, request_tool_schemas)
         context_adjustment_count = 0
         context_compact_count = 0
         previous_context_adjustment = None
@@ -2491,9 +2503,7 @@ class MultiTurnReactAgent(FnCallAgent):
                     )
                     if compacted is not None:
                         msgs = compacted
-                        local_input_tokens = estimate_request_input_tokens(
-                            msgs, request_tool_schemas
-                        )
+                        local_input_tokens = self.count_tokens(msgs, request_tool_schemas)
                         context_compact_count += 1
                         max_tries += 1
                         attempt += 1
@@ -2613,9 +2623,7 @@ class MultiTurnReactAgent(FnCallAgent):
                         )
                         if compacted is not None:
                             msgs = compacted
-                            local_input_tokens = estimate_request_input_tokens(
-                                msgs, request_tool_schemas
-                            )
+                            local_input_tokens = self.count_tokens(msgs, request_tool_schemas)
                             context_compact_count += 1
                             max_tries += 1
                             attempt += 1
@@ -2719,7 +2727,38 @@ class MultiTurnReactAgent(FnCallAgent):
             f"requested_model={self.served_model_name}"
         )
 
-    def count_tokens(self, messages):
+    def _count_image_tokens(self, messages):
+        urls = []
+        for message in messages:
+            if isinstance(message.get("content"), list):
+                for part in message["content"]:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        image_url = part["image_url"]
+                        urls.append(image_url["url"] if isinstance(image_url, dict) else image_url)
+        if not urls:
+            return 0
+
+        from transformers import AutoProcessor
+        from transformers.image_utils import load_image
+
+        if self._context_processor is None:
+            self._context_processor = AutoProcessor.from_pretrained(
+                self.llm_local_path, local_files_only=True, trust_remote_code=True,
+            )
+        processor = self._context_processor.image_processor
+        total = 0
+        for url in urls:
+            key = hashlib.sha256(url.encode()).digest()
+            if key not in self._context_image_tokens:
+                with load_image(url) as image:
+                    # Match Qwen/vLLM's resize, patch and spatial-merge rules
+                    # without repeatedly preprocessing pixels on every turn.
+                    patches = processor.get_number_of_image_patches(image.height, image.width, {})
+                self._context_image_tokens[key] = patches // processor.merge_size**2
+            total += self._context_image_tokens[key]
+        return total
+
+    def count_tokens(self, messages, tool_schemas=None):
         """Count the request tokens used for context management.
 
         Prefer the model's local chat-template tokenizer so the count includes
@@ -2727,10 +2766,13 @@ class MultiTurnReactAgent(FnCallAgent):
         when the tokenizer is unavailable; context management must remain best
         effort rather than breaking a rollout during tokenizer initialization.
         """
-        try:
-            tool_schemas = self._active_tool_schemas_for_current_task()
-        except Exception:
-            tool_schemas = None
+        # An image-count failure must not silently turn into a text-only budget.
+        image_tokens = self._count_image_tokens(messages)
+        if tool_schemas is None:
+            try:
+                tool_schemas = self._active_tool_schemas_for_current_task()
+            except Exception:
+                tool_schemas = None
         if not self._context_tokenizer_unavailable and self._context_tokenizer is None:
             try:
                 from transformers import AutoTokenizer
@@ -2744,6 +2786,14 @@ class MultiTurnReactAgent(FnCallAgent):
                 self._context_tokenizer_unavailable = True
         if self._context_tokenizer is not None:
             try:
+                # OpenAI stores arguments as JSON strings; Qwen templates
+                # iterate a mapping. Normalize a copy to preserve API replay.
+                count_messages = copy.deepcopy(messages)
+                for message in count_messages:
+                    for call in message.get("tool_calls") or []:
+                        function = call.get("function", call)
+                        if isinstance(function.get("arguments"), str):
+                            function["arguments"] = json.loads(function["arguments"])
                 kwargs = {
                     "tokenize": True,
                     "add_generation_prompt": True,
@@ -2751,17 +2801,20 @@ class MultiTurnReactAgent(FnCallAgent):
                 if tool_schemas:
                     kwargs["tools"] = tool_schemas
                 encoded = self._context_tokenizer.apply_chat_template(
-                    messages,
+                    count_messages,
                     **kwargs,
                 )
-                if isinstance(encoded, dict):
+                if isinstance(encoded, Mapping):
                     encoded = encoded.get("input_ids", [])
-                if hasattr(encoded, "shape"):
-                    return int(encoded.shape[-1])
-                return len(encoded)
+                if hasattr(encoded, "tolist"):
+                    encoded = encoded.tolist()
+                if encoded and isinstance(encoded[0], list):
+                    encoded = encoded[0]
+                placeholders = encoded.count(self._context_processor.image_token_id) if image_tokens else 0
+                return len(encoded) + image_tokens - placeholders
             except Exception:
                 pass
-        return estimate_request_input_tokens(messages, tool_schemas)
+        return estimate_request_input_tokens(messages, tool_schemas) + image_tokens
 
     def _estimate_trajectory_tokens(self, messages):
         return self.count_tokens(messages)
