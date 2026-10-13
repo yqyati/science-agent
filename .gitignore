@@ -1,8 +1,10 @@
 sandbox.local.env
 science_agent_trace.jsonl
+
+# Python bytecode caches.
 __pycache__/
-inference/__pycache__/
-science_agent/__pycache__/
+*.pyc
+*.pyo
 
 # Local credentials, editor backups, and runtime artifacts.
 *.swp
