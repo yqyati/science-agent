@@ -1119,6 +1119,12 @@ class MultiTurnReactAgent(FnCallAgent):
         self.llm_generate_cfg = llm["generate_cfg"]
         self.llm_local_path = llm["model"]
         self.served_model_name = llm.get("served_model_name") or self.llm_local_path
+        self._response_model_type = f"{self.llm_local_path} {self.served_model_name}".lower()
+        config_path = os.path.join(self.llm_local_path, "config.json")
+        if AGENT_OBSERVATION_MASKING and os.path.isfile(config_path):
+            # Checkpoint directory names need not identify the model family.
+            with open(config_path, encoding="utf-8") as config_file:
+                self._response_model_type = json.load(config_file)["model_type"].lower()
         self._served_model_fallbacks_raw = os.getenv(
             "SERVED_MODEL_NAME_FALLBACKS", ""
         )
@@ -1386,8 +1392,7 @@ class MultiTurnReactAgent(FnCallAgent):
         reasoning = self._extract_reasoning(response_message)
         content = safe_strip(getattr(response_message, "content", ""))
         if not self._deepseek_v4_response_enabled():
-            model_names = f"{self.llm_local_path} {self.served_model_name}".lower()
-            if AGENT_OBSERVATION_MASKING and "qwen" in model_names:
+            if AGENT_OBSERVATION_MASKING and "qwen" in self._response_model_type:
                 # Molt decodes raw completion tokens; framing belongs to the
                 # chat template, not to the replayed assistant body.
                 content = re.sub(r"(?:\s*<\|(?:im_end|endoftext)\|>)+\s*$", "", content).strip()

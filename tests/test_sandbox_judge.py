@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 
 HARNESS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HARNESS_ROOT / "inference"))
-from sandbox_gateway import AgentSandboxRun
+import sandbox_gateway as gateway
 
 ADAPTER = HARNESS_ROOT.parent.parent / "labs-molt/examples/python/agents/science_legacy_react_sandbox.py"
 
@@ -29,7 +29,8 @@ def load_adapter(prediction="5003"):
         "SCIENCE_AGENT_ROOT": HARNESS_ROOT, "logger": logging.getLogger(__name__),
         "ChatAgent": object, "ChatContext": object, "Result": SimpleNamespace,
         "torch": SimpleNamespace(tensor=lambda value, **kw: value, float32=None),
-        "AgentSandboxRun": AgentSandboxRun,
+        "sandbox_run_scope": gateway.sandbox_run_scope,
+        "shared_sandbox_run": gateway.shared_sandbox_run,
         "MultiTurnReactAgent": lambda **kw: SimpleNamespace(
             _run=lambda *args: {"prediction": prediction, "messages": []}),
         "find_boxed_spans": lambda text: [],
@@ -63,7 +64,9 @@ class JudgeTests(unittest.IsolatedAsyncioTestCase):
         self.run = Mock()
         self.run.run_http.return_value = response()
         self.factory = Mock(return_value=self.run)
-        self.namespace["AgentSandboxRun"] = self.factory
+        factory_patch = patch.object(gateway, "AgentSandboxRun", self.factory)
+        factory_patch.start()
+        self.addCleanup(factory_patch.stop)
         self.agent = self.namespace["ScienceLegacyReactAgent"]()
 
     async def test_judge_transport_auth_and_cleanup(self):
@@ -93,7 +96,8 @@ class JudgeTests(unittest.IsolatedAsyncioTestCase):
         self.run.run_http.return_value = {"status_code": 503, "text": "service unavailable"}
         with patch.object(asyncio, "sleep", return_value=None):
             result = await self.agent.run(context())
-        self.assertEqual(result.reward, -10)
+        self.assertEqual(result.reward, -1)
+        self.assertEqual(result.score, -1)
         self.assertEqual(result.info["science_judge_valid"], 0)
         self.assertIn("503", result.info["science_judge_error"])
         self.assertEqual(result.info["science_judge_response"], "service unavailable")
@@ -112,12 +116,14 @@ class JudgeTests(unittest.IsolatedAsyncioTestCase):
         self.namespace["MultiTurnReactAgent"] = lambda **kw: SimpleNamespace(_run=lambda *args: {"prediction": ""})
         result = await self.agent.run(context())
         self.assertEqual(result.reward, 0)
-        self.factory.assert_not_called()
+        self.run.run_http.assert_not_called()
+        self.run.ensure.assert_not_called()
         self.namespace["MultiTurnReactAgent"] = lambda **kw: SimpleNamespace(_run=lambda *args: {"prediction": "5003"})
         with patch.dict(os.environ, {"SCIENCE_AGENT_REWARD_MODE": "f1"}):
             result = await self.agent.run(context())
         self.assertEqual(result.reward, 1)
-        self.factory.assert_not_called()
+        self.run.run_http.assert_not_called()
+        self.run.ensure.assert_not_called()
 
     async def test_budget_exhausted_placeholder_skips_judge_and_marks_truncated(self):
         self.namespace["MultiTurnReactAgent"] = lambda **kw: SimpleNamespace(_run=lambda *args: {
@@ -130,7 +136,8 @@ class JudgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.info["science_generation_truncated"], 0)
         self.assertEqual(result.info["science_trajectory_budget_exhausted"], 1)
         self.assertEqual(result.info["science_termination"], "trajectory budget exhausted without valid final answer")
-        self.factory.assert_not_called()
+        self.run.run_http.assert_not_called()
+        self.run.ensure.assert_not_called()
 
     async def test_budget_exhausted_real_answer_is_graded(self):
         self.namespace["MultiTurnReactAgent"] = lambda **kw: SimpleNamespace(_run=lambda *args: {

@@ -55,6 +55,9 @@ class SandboxGatewayClient:
                     return json.loads(raw.decode("utf-8")) if raw else None
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")[:1000]
+                # An already-removed sandbox needs no further cleanup.
+                if method == "DELETE" and exc.code == 404 and "sandbox not found" in detail.lower():
+                    return None
                 # GET cannot execute Agent code; retry transient authorization
                 # and gateway failures without replaying create/command requests.
                 if method == "GET" and exc.code in {403, 502, 503, 504} and attempt < 2:
@@ -476,6 +479,8 @@ def sandbox_run_scope(function):
             finally:
                 try:
                     await asyncio.to_thread(run.close)
+                except Exception:
+                    logging.getLogger(__name__).exception("Sandbox cleanup failed id=%s", run.sandbox_id)
                 finally:
                     _SHARED_RUN.reset(token)
         return async_wrapped
@@ -495,6 +500,8 @@ def sandbox_run_scope(function):
         finally:
             try:
                 run.close()
+            except Exception:
+                logging.getLogger(__name__).exception("Sandbox cleanup failed id=%s", run.sandbox_id)
             finally:
                 _SHARED_RUN.reset(token)
     return wrapped

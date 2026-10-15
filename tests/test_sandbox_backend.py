@@ -226,6 +226,61 @@ class SandboxTests(unittest.TestCase):
         run.close()
         self.assertEqual(run.sandbox_id, "")
 
+    def test_delete_missing_sandbox_completes_cleanup_without_retry(self):
+        run = gateway.AgentSandboxRun()
+        run.client = RealGatewayClient("http://gateway", "test-token")
+        run.sandbox_id = "missing-sandbox"
+        run._python_started = run._http_started = True
+        body = b'{"detail":{"code":"NOT_FOUND","message":"sandbox not found"}}'
+        error = HTTPError("http://gateway", 404, "Not Found", {}, io.BytesIO(body))
+        with patch.object(gateway.urllib.request, "urlopen", side_effect=error) as request:
+            run.close()
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(run.sandbox_id, "")
+        self.assertFalse(run._python_started or run._http_started)
+
+    def test_delete_does_not_ignore_other_http_errors(self):
+        client = RealGatewayClient("http://gateway", "test-token")
+        for status, body in [(404, b"route not found"), (403, b"sandbox not found"), (500, b"server error")]:
+            with self.subTest(status=status):
+                error = HTTPError("http://gateway", status, "error", {}, io.BytesIO(body))
+                with patch.object(gateway.urllib.request, "urlopen", side_effect=error):
+                    with self.assertRaises(gateway.SandboxGatewayError):
+                        client.delete("sid")
+
+    def test_cleanup_failure_preserves_result_or_original_error(self):
+        result = {"prediction": "5003", "reward": 1.0, "messages": ["trajectory"]}
+        original_error = ValueError("generation failed")
+        for asynchronous in (False, True):
+            for fail in (False, True):
+                with self.subTest(asynchronous=asynchronous, fail=fail):
+                    captured = []
+
+                    def body():
+                        run = gateway.shared_sandbox_run()
+                        run.ensure()
+                        run.client.delete = unittest.mock.Mock(side_effect=RuntimeError("delete failed"))
+                        captured.append(run)
+                        if fail:
+                            raise original_error
+                        return result
+
+                    async def async_body():
+                        return body()
+
+                    wrapped = gateway.sandbox_run_scope(async_body if asynchronous else body)
+                    with patch.object(gateway.time, "sleep"), self.assertLogs(gateway.__name__, level="ERROR") as logs:
+                        if fail:
+                            with self.assertRaises(ValueError) as raised:
+                                asyncio.run(wrapped()) if asynchronous else wrapped()
+                            self.assertIs(raised.exception, original_error)
+                        else:
+                            actual = asyncio.run(wrapped()) if asynchronous else wrapped()
+                            self.assertIs(actual, result)
+                    self.assertEqual(captured[0].client.delete.call_count, 3)
+                    self.assertTrue(any("Sandbox cleanup failed id=sandbox-1" in log for log in logs.output))
+                    self.assertIsNone(gateway._SHARED_RUN.get())
+
     def test_agent_cleanup_retries_transient_delete_failure(self):
         captured = []
 
