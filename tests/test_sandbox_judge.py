@@ -84,24 +84,40 @@ class JudgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_retry_reuses_run_and_preserves_incorrect_score(self):
         self.run.run_http.side_effect = [
             {"status_code": 599, "text": "connection timed out"}, response(0)]
-        with patch.object(asyncio, "sleep", return_value=None):
+        with patch.object(asyncio, "sleep", return_value=None) as sleep:
             result = await self.agent.run(context())
         self.assertEqual(result.reward, 0)
         self.assertEqual(result.info["science_judge_valid"], 1)
         self.assertEqual(self.run.run_http.call_count, 2)
+        sleep.assert_awaited_once_with(1)
         self.factory.assert_called_once()
         self.run.close.assert_called_once()
 
     async def test_failed_judge_retains_status_and_closes(self):
         self.run.run_http.return_value = {"status_code": 503, "text": "service unavailable"}
-        with patch.object(asyncio, "sleep", return_value=None):
+        with patch.object(asyncio, "sleep", return_value=None) as sleep:
             result = await self.agent.run(context())
         self.assertEqual(result.reward, -1)
         self.assertEqual(result.score, -1)
         self.assertEqual(result.info["science_judge_valid"], 0)
         self.assertIn("503", result.info["science_judge_error"])
         self.assertEqual(result.info["science_judge_response"], "service unavailable")
-        self.assertEqual(self.run.run_http.call_count, 3)
+        self.assertEqual(self.run.run_http.call_count, 9)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [1, 5, 10, 30, 60, 300, 300, 300])
+        self.run.close.assert_called_once()
+
+    async def test_judge_recovers_on_last_retry_without_regenerating_answer(self):
+        generate = Mock(return_value={"prediction": "5003", "messages": []})
+        self.namespace["MultiTurnReactAgent"] = lambda **kw: SimpleNamespace(_run=generate)
+        self.run.run_http.side_effect = [{"status_code": 599, "text": "connection refused"}] * 8 + [response()]
+        with patch.object(asyncio, "sleep", return_value=None) as sleep:
+            result = await self.agent.run(context())
+        self.assertEqual(result.reward, 1)
+        self.assertEqual(result.info["science_judge_valid"], 1)
+        self.assertEqual(self.run.run_http.call_count, 9)
+        self.assertEqual(sleep.await_count, 8)
+        generate.assert_called_once()
+        self.factory.assert_called_once()
         self.run.close.assert_called_once()
 
     async def test_invalid_json_is_retried_and_cleanup_failure_preserves_grade(self):
