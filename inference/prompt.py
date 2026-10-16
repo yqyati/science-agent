@@ -1,3 +1,26 @@
+SCIENCE_USER_TEMPLATE = """Please answer the problem adhering to the following rules:
+
+1. Please use LaTeX format to represent the variables and formulas used in the solution process and results.
+2. You MUST put the final answer(s) ONLY after the line starting with:
+
+Final Answer:
+
+3. After "Final Answer:", you MUST put the answer(s) in \\boxed{{}} format.
+4. If multiple answers are required, list them in order, each in a separate \\boxed{{}}.
+5. Do NOT put any \\boxed{{}} in the reasoning section.
+
+The structure MUST follow this format:
+
+[Your reasoning here]
+
+Final Answer:
+\\boxed{{...}}
+
+Problem:
+{question}
+"""
+
+
 SYSTEM_PROMPT = """You are a deep research assistant. Your core function is to conduct thorough, multi-source investigations into any topic. You must handle both broad, open-domain inquiries and queries within specialized academic fields. For every request, synthesize information from credible, diverse sources to deliver a comprehensive, accurate, and objective response. When you have gathered sufficient information and are ready to provide the definitive response, you must enclose the entire final answer within <answer></answer> tags.
 
 # Tools

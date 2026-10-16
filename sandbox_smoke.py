@@ -6,6 +6,7 @@ import io
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "inference"))
@@ -145,17 +146,28 @@ def main():
             assert "output truncated" in large, large[:100]
             print("page saved/Python tool read/cache/output limit: passed", flush=True)
         if args.judge:
-            response = run.run_http({
+            judge_request = {
                 "method": "POST", "url": os.environ["SCIENCE_AGENT_JUDGE_BASE_URL"].rstrip("/") + "/chat/completions",
                 "headers": {"Authorization": "Bearer " + (os.getenv("SCIENCE_AGENT_JUDGE_API_KEY") or os.environ["API_KEY"])},
                 "json": {"model": os.environ["SCIENCE_AGENT_JUDGE_MODEL"], "temperature": 0.0,
                          "max_tokens": int(os.getenv("SCIENCE_AGENT_JUDGE_MAX_TOKENS", "1800")),
                          "response_format": {"type": "json_object"},
                          "messages": [{"role": "user", "content": 'Grade candidate 2 against reference 2 for 1+1. Return JSON {"score": 1, "correct": true}.'}]},
-            }, timeout=float(os.getenv("SCIENCE_AGENT_JUDGE_TIMEOUT", "180")))
-            assert response["status_code"] == 200, f"Judge HTTP {response['status_code']}: {response['text'][:500]}"
-            grade = json.loads(json.loads(response["text"])["choices"][0]["message"]["content"])
-            assert grade["score"] == 1 and grade["correct"] is True, grade
+            }
+            retry_delays = (1, 5, 10, 30, 60, 180, 180, 180)
+            for attempt in range(len(retry_delays) + 1):
+                try:
+                    response = run.run_http(judge_request, timeout=float(os.getenv("SCIENCE_AGENT_JUDGE_TIMEOUT", "180")))
+                    assert response["status_code"] == 200, f"Judge HTTP {response['status_code']}: {response['text'][:500]}"
+                    grade = json.loads(json.loads(response["text"])["choices"][0]["message"]["content"])
+                    assert grade["score"] == 1 and grade["correct"] is True, grade
+                    break
+                except Exception as exc:
+                    print(f"judge attempt {attempt + 1}/{len(retry_delays) + 1} failed: {exc}", flush=True)
+                    if attempt == len(retry_delays):
+                        raise
+                    print(f"judge retry in {retry_delays[attempt]}s", flush=True)
+                    time.sleep(retry_delays[attempt])
             print("judge", os.environ["SCIENCE_AGENT_JUDGE_MODEL"], "via Sandbox: passed", flush=True)
         if args.tools:
             from tool_search_mcp_r1 import Search

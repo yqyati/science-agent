@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
 from unittest.mock import patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "inference"))
 
@@ -20,6 +20,74 @@ import sandbox_http_worker as http_worker
 import sandbox_python_worker as python_worker
 import tool_http_client as transport
 RealGatewayClient = gateway.SandboxGatewayClient
+
+
+class SandboxCreateRetryTests(unittest.TestCase):
+    def test_transient_http_failure_recovers_without_changing_payload(self):
+        client = RealGatewayClient("http://gateway", "secret-token", "resource")
+        for status in (403, 429, 500, 502, 503, 504):
+            with self.subTest(status=status):
+                error = HTTPError("http://gateway", status, "temporary", {}, io.BytesIO(b"temporary"))
+                with patch.object(gateway.urllib.request, "urlopen", side_effect=[
+                    error, io.BytesIO(b'{"id":"created"}'),
+                ]) as request, patch.object(gateway.time, "sleep") as sleep:
+                    with self.assertLogs(gateway.__name__, level="WARNING") as logs:
+                        self.assertEqual(client.create(image="image", env={"API_KEY": "secret-key"}), "created")
+                self.assertEqual(request.call_count, 2)
+                sleep.assert_called_once_with(1)
+                first, second = [call.args[0] for call in request.call_args_list]
+                self.assertEqual(first.data, second.data)
+                self.assertEqual(json.loads(first.data)["env"], {"API_KEY": "secret-key"})
+                self.assertNotIn("secret-key", str(logs.output))
+                self.assertNotIn("secret-token", str(logs.output))
+
+    def test_network_failures_recover_with_bounded_backoff(self):
+        client = RealGatewayClient("http://gateway", "token")
+        with patch.object(gateway.urllib.request, "urlopen", side_effect=[
+            URLError(ConnectionRefusedError("refused")), TimeoutError("timed out"),
+            URLError("temporary DNS failure"), io.BytesIO(b'{"id":"created"}'),
+        ]) as request, patch.object(gateway.time, "sleep") as sleep:
+            self.assertEqual(client.create(image="image"), "created")
+        self.assertEqual(request.call_count, 4)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 5, 10])
+
+    def test_create_stops_after_four_failures(self):
+        client = RealGatewayClient("http://gateway", "token")
+        with patch.object(gateway.urllib.request, "urlopen", side_effect=TimeoutError("timed out")) as request, \
+                patch.object(gateway.time, "sleep") as sleep:
+            with self.assertRaisesRegex(gateway.SandboxGatewayError, "create failed after 4 attempts"):
+                client.create(image="image")
+        self.assertEqual(request.call_count, 4)
+        self.assertEqual(sleep.call_count, 3)
+
+    def test_permanent_http_failures_are_not_retried(self):
+        client = RealGatewayClient("http://gateway", "token")
+        for status in (400, 401, 404, 409, 422):
+            with self.subTest(status=status):
+                error = HTTPError("http://gateway", status, "permanent", {}, io.BytesIO(b"permanent"))
+                with patch.object(gateway.urllib.request, "urlopen", side_effect=error) as request, \
+                        patch.object(gateway.time, "sleep") as sleep:
+                    with self.assertRaises(gateway.SandboxGatewayError):
+                        client.create(image="image")
+                self.assertEqual(request.call_count, 1)
+                sleep.assert_not_called()
+
+    def test_missing_id_does_not_trigger_another_creation(self):
+        client = RealGatewayClient("http://gateway", "token")
+        with patch.object(gateway.urllib.request, "urlopen", return_value=io.BytesIO(b'{}')) as request:
+            with self.assertRaisesRegex(gateway.SandboxGatewayError, "no sandbox id"):
+                client.create(image="image")
+        self.assertEqual(request.call_count, 1)
+
+    def test_other_posts_are_not_replayed(self):
+        client = RealGatewayClient("http://gateway", "token")
+        error = HTTPError("http://gateway", 503, "temporary", {}, io.BytesIO(b"temporary"))
+        with patch.object(gateway.urllib.request, "urlopen", side_effect=error) as request, \
+                patch.object(gateway.time, "sleep") as sleep:
+            with self.assertRaises(gateway.SandboxGatewayError):
+                client._request("POST", "/v1/sandboxes/existing/commands", {"command": "work"})
+        self.assertEqual(request.call_count, 1)
+        sleep.assert_not_called()
 
 
 class FakeClient:

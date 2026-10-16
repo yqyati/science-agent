@@ -2,6 +2,7 @@
 
 import ast
 import asyncio
+import importlib.util
 import json
 import logging
 import os
@@ -31,6 +32,7 @@ def load_adapter(prediction="5003"):
         "torch": SimpleNamespace(tensor=lambda value, **kw: value, float32=None),
         "sandbox_run_scope": gateway.sandbox_run_scope,
         "shared_sandbox_run": gateway.shared_sandbox_run,
+        "AgentSandboxRun": lambda: gateway.AgentSandboxRun(),
         "MultiTurnReactAgent": lambda **kw: SimpleNamespace(
             _run=lambda *args: {"prediction": prediction, "messages": []}),
         "find_boxed_spans": lambda text: [],
@@ -94,7 +96,11 @@ class JudgeTests(unittest.IsolatedAsyncioTestCase):
         self.run.close.assert_called_once()
 
     async def test_failed_judge_retains_status_and_closes(self):
-        self.run.run_http.return_value = {"status_code": 503, "text": "service unavailable"}
+        replacements = [Mock(), Mock()]
+        runs = [self.run, *replacements]
+        self.factory.side_effect = runs
+        for run in runs:
+            run.run_http.return_value = {"status_code": 503, "text": "service unavailable"}
         with patch.object(asyncio, "sleep", return_value=None) as sleep:
             result = await self.agent.run(context())
         self.assertEqual(result.reward, -1)
@@ -103,8 +109,13 @@ class JudgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("503", result.info["science_judge_error"])
         self.assertEqual(result.info["science_judge_response"], "service unavailable")
         self.assertEqual(self.run.run_http.call_count, 9)
-        self.assertEqual([call.args[0] for call in sleep.await_args_list], [1, 5, 10, 30, 60, 300, 300, 300])
-        self.run.close.assert_called_once()
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [1, 5, 10, 30, 60, 180, 180, 180] * 3)
+        self.assertEqual(result.info["science_judge_attempts"], 27)
+        self.assertEqual(result.info["science_judge_sandbox_restarts"], 2)
+        self.assertEqual(self.factory.call_count, 3)
+        for run in runs:
+            self.assertEqual(run.run_http.call_count, 9)
+            run.close.assert_called_once()
 
     async def test_judge_recovers_on_last_retry_without_regenerating_answer(self):
         generate = Mock(return_value={"prediction": "5003", "messages": []})
@@ -119,6 +130,64 @@ class JudgeTests(unittest.IsolatedAsyncioTestCase):
         generate.assert_called_once()
         self.factory.assert_called_once()
         self.run.close.assert_called_once()
+
+    async def test_replacement_preserves_answer_and_accepts_incorrect_grade(self):
+        generate = Mock(return_value={"prediction": "5003", "messages": []})
+        self.namespace["MultiTurnReactAgent"] = lambda **kw: SimpleNamespace(_run=generate)
+        replacement = Mock()
+        replacement.run_http.return_value = response(0)
+        self.factory.side_effect = [self.run, replacement]
+        self.run.run_http.return_value = {"status_code": 599, "text": "connection refused"}
+        with patch.object(asyncio, "sleep", return_value=None):
+            result = await self.agent.run(context())
+        self.assertEqual(result.reward, 0)
+        self.assertEqual(result.info["science_judge_valid"], 1)
+        self.assertEqual(result.info["science_prediction"], "5003")
+        self.assertEqual(result.info["science_judge_attempts"], 10)
+        self.assertEqual(result.info["science_judge_sandbox_restarts"], 1)
+        generate.assert_called_once()
+        self.assertEqual(self.factory.call_count, 2)
+        self.assertEqual(replacement.run_http.call_args, self.run.run_http.call_args)
+        self.run.close.assert_called_once()
+        replacement.close.assert_called_once()
+
+    async def test_second_replacement_recovers_from_missing_sandbox(self):
+        middle, last = Mock(), Mock()
+        self.factory.side_effect = [self.run, middle, last]
+        self.run.run_http.side_effect = gateway.SandboxGatewayError("HTTP 404 sandbox not found")
+        middle.run_http.return_value = {"status_code": 503, "text": "unavailable"}
+        last.run_http.return_value = response()
+        last.close.side_effect = RuntimeError("cleanup failed")
+        with patch.object(asyncio, "sleep", return_value=None):
+            result = await self.agent.run(context())
+        self.assertEqual(result.reward, 1)
+        self.assertEqual(result.info["science_judge_sandbox_restarts"], 2)
+        self.assertEqual(result.info["science_judge_attempts"], 19)
+        for run in (self.run, middle, last):
+            run.close.assert_called_once()
+
+    async def test_cancel_replacement_waits_for_request_and_closes_both_runs(self):
+        started, release = Event(), Event()
+        replacement = Mock()
+        def request(*args, **kwargs):
+            started.set()
+            release.wait(5)
+            return response()
+        replacement.run_http.side_effect = request
+        self.factory.side_effect = [self.run, replacement]
+        self.run.run_http.return_value = {"status_code": 599, "text": "connection refused"}
+        with patch.object(asyncio, "sleep", return_value=None):
+            task = asyncio.create_task(self.agent.run(context()))
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 5))
+                task.cancel()
+                replacement.close.assert_not_called()
+            finally:
+                release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.run.close.assert_called_once()
+        replacement.close.assert_called_once()
 
     async def test_invalid_json_is_retried_and_cleanup_failure_preserves_grade(self):
         self.run.run_http.side_effect = [{"status_code": 200, "text": "invalid JSON"}, response()]
@@ -205,6 +274,57 @@ class JudgeTests(unittest.IsolatedAsyncioTestCase):
         for run in (self.run, other):
             self.assertEqual(run.run_http.call_args.args[0]["headers"]["Authorization"], "Bearer fallback-key")
             run.close.assert_called_once()
+
+
+class SmokeJudgeTests(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("sandbox_smoke", HARNESS_ROOT / "sandbox_smoke.py")
+        self.smoke = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.smoke)
+        self.run = Mock()
+        self.run.run_python.side_effect = ["42", "41"]
+        self.run.run_http.return_value = response()
+        patches = [
+            patch.dict(os.environ, {
+                "SCIENCE_AGENT_TOOL_HTTP_BACKEND": "gateway_sandbox",
+                "SCIENCE_AGENT_JUDGE_BASE_URL": "http://judge/v1",
+                "SCIENCE_AGENT_JUDGE_MODEL": "o3-mini", "API_KEY": "test-key",
+            }),
+            patch.object(sys, "argv", ["sandbox_smoke.py", "--judge"]),
+            patch.object(self.smoke, "shared_sandbox_run", return_value=self.run),
+            patch.object(self.smoke, "close_shared_sandbox_run"),
+            patch.object(self.smoke, "tool_http_request", return_value=Mock(
+                status_code=200, backend="gateway_sandbox", text="Example Domain")),
+            patch.object(self.smoke.time, "sleep"),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def test_first_success_does_not_wait(self):
+        self.smoke.main()
+        self.run.run_http.assert_called_once()
+        self.smoke.time.sleep.assert_not_called()
+        self.smoke.close_shared_sandbox_run.assert_called_once()
+
+    def test_last_retry_recovers_after_transport_and_response_failures(self):
+        self.run.run_http.side_effect = [
+            RuntimeError("gateway unavailable"), {"status_code": 599, "text": "connection refused"},
+            {"status_code": 200, "text": "invalid JSON"}, response(0),
+        ] * 2 + [response()]
+        self.smoke.main()
+        self.assertEqual(self.run.run_http.call_count, 9)
+        self.assertEqual([call.args[0] for call in self.smoke.time.sleep.call_args_list],
+                         [1, 5, 10, 30, 60, 180, 180, 180])
+        self.smoke.close_shared_sandbox_run.assert_called_once()
+
+    def test_exhausted_retries_still_fail_preflight_and_clean_up(self):
+        self.run.run_http.return_value = {"status_code": 599, "text": "connection refused"}
+        with self.assertRaisesRegex(AssertionError, "Judge HTTP 599"):
+            self.smoke.main()
+        self.assertEqual(self.run.run_http.call_count, 9)
+        self.assertEqual(self.smoke.time.sleep.call_count, 8)
+        self.smoke.close_shared_sandbox_run.assert_called_once()
 
 
 if __name__ == "__main__":

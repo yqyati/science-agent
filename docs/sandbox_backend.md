@@ -52,6 +52,16 @@ command endpoint. No custom image build is needed. Both workers must pass
 `/health` before use; initialization errors are reported without silently
 switching to single-shot Python or host HTTP.
 
+The shared creation endpoint retries HTTP 403, 429, 500, 502, 503, 504 and
+URL/timeout errors up to four total attempts, waiting 1, 5, then 10 seconds.
+Other HTTP errors and successful responses missing an instance ID fail without
+another creation attempt. This policy applies only to creating an instance;
+it does not replay command or tool POSTs. Caller-level retries (search or judge)
+can start another bounded creation cycle after these attempts are exhausted.
+Server-side idempotency has not been established: a lost creation response can
+leave an instance whose ID is unknown and cannot be explicitly cleaned up by
+this client. Such an instance relies on the requested platform lifetime.
+
 `QwenReactAgent._run` has a gateway-only run scope and deletes the instance in
 `finally`. Direct tool callers must invoke `close_sandbox_http_run()` or
 `close_shared_sandbox_run()` in `finally`. Python state persists within a run.

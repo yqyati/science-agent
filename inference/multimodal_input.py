@@ -3,6 +3,7 @@ import os
 from typing import Any, Optional
 
 from file_tools.utils import encode_image_as_base64
+from prompt import SCIENCE_USER_TEMPLATE
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(CURRENT_DIR)
@@ -344,6 +345,8 @@ def build_initial_user_message(
     base_dir: Optional[str] = None,
 ) -> dict[str, Any]:
     text = question + question_suffix
+    if not text.startswith(SCIENCE_USER_TEMPLATE.format(question="").rstrip()):
+        text = SCIENCE_USER_TEMPLATE.format(question=text)
     if not model_image_inputs_enabled():
         return {"role": "user", "content": text}
 

@@ -88,7 +88,28 @@ class SandboxGatewayClient:
             payload["env"] = env
         if network_policy is not None:
             payload["networkPolicy"] = network_policy
-        data = self._request("POST", "/v1/sandboxes", payload)
+        retry_delays = (1, 5, 10)
+        for attempt in range(len(retry_delays) + 1):
+            try:
+                data = self._request("POST", "/v1/sandboxes", payload)
+                break
+            except SandboxGatewayError as exc:
+                cause = exc.__cause__
+                transient = (cause.code in {403, 429, 500, 502, 503, 504}
+                             if isinstance(cause, urllib.error.HTTPError)
+                             else isinstance(cause, (urllib.error.URLError, TimeoutError)))
+                if not transient:
+                    raise
+                if attempt == len(retry_delays):
+                    raise SandboxGatewayError(f"Sandbox create failed after {attempt + 1} attempts: {exc}") from exc
+                # Creation retries must not replay command or tool POSTs. Without
+                # server idempotency, a lost response can leave an unknown instance.
+                logging.getLogger(__name__).warning(
+                    "Sandbox create retry attempt=%d/4 status=%s error=%s delay=%ss; "
+                    "a lost response may leave an instance without a known ID",
+                    attempt + 1, getattr(cause, "code", None), type(cause).__name__, retry_delays[attempt],
+                )
+                time.sleep(retry_delays[attempt])
         sandbox_id = str((data or {}).get("id") or "")
         if not sandbox_id:
             raise SandboxGatewayError(f"create response has no sandbox id: {data!r}")
