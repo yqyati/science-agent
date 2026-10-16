@@ -133,6 +133,7 @@ class SandboxTests(unittest.TestCase):
     def setUp(self):
         self.env = patch.dict(os.environ, {
             "OPEN_SANDBOX_GATEWAY_TOKEN": "test-token",
+            "SCIENCE_AGENT_SANDBOX_RECOVERY": "0",
             "SCIENCE_AGENT_TOOL_HTTP_BACKEND": "gateway_sandbox",
         })
         self.env.start()

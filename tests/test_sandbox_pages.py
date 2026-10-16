@@ -74,11 +74,25 @@ class PageTests(unittest.TestCase):
         with patch.object(worker, "urlopen", side_effect=error):
             self.assertEqual(self.request()["status_code"], 403)
         self.assertFalse(Path("pages").exists())
+
         with self.assertRaises(ValueError):
             worker.save_page(self.payload, " ")
         with patch("tool_url_guard.evaluate_guard_value", return_value=SimpleNamespace(blocked=True)):
             self.assertEqual(worker.save_page(self.payload, "blocked text"), {"blocked": True})
         self.assertFalse(Path("pages").exists())
+
+    def test_recovery_transport_includes_full_original_and_cached_page(self):
+        text = "original evidence\n" * 1000
+        with patch.object(worker, "urlopen") as fetch:
+            fetch.return_value.__enter__.return_value = SimpleNamespace(status=200, read=lambda: text.encode())
+            payload = dict(self.payload, recovery_backup=True)
+            first = self.request(payload)
+            cached = self.request(payload)
+        fetch.assert_called_once()
+        path = first['page']['path']
+        self.assertEqual(first['recovery_files'][path], text)
+        self.assertEqual(cached['recovery_files'], first['recovery_files'])
+        self.assertEqual(json.loads(first['recovery_files'][str(Path(path).with_name('source.json'))])['source_url'], self.payload['source_url'])
 
     def test_read_page_file_mode_skips_host_fetch_tokenizer_and_summary(self):
         source = ROOT / "inference/tool_visit_mcp_r1.py"

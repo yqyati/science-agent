@@ -17,11 +17,79 @@ import importlib.util
 import subprocess
 import sys
 import traceback
+import threading
+import hashlib
 from contextlib import redirect_stderr, redirect_stdout
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 GLOBALS: dict[str, object] = {"__name__": "__agent_sandbox__"}
+EXECUTION_LOCK = threading.Lock()
+OPERATIONS_LOCK = threading.Lock()
+OPERATIONS = {}
+REPLAY = threading.local()
+
+
+def replay_audit(event, args):
+    """Prevent replay from repeating network/process side effects.
+
+    This is a recovery guard, not a security boundary for hostile Python.
+    Reads needed by imports are allowed; writes must stay in /workspace.
+    """
+    if not getattr(REPLAY, "active", False):
+        return
+    if event.startswith(("socket.", "subprocess.", "os.exec", "os.spawn")) or event in {
+        "os.system", "os.fork", "os.forkpty", "os.putenv", "os.unsetenv", "os.chdir",
+        "os.symlink", "os.link", "ctypes.dlopen", "ctypes.dlsym",
+    }:
+        REPLAY.violation = event
+        raise RuntimeError("Recovery replay blocked external operation: " + event)
+    paths = []
+    if event == "open":
+        path, mode, flags = args
+        if isinstance(path, int):
+            REPLAY.violation = event
+            raise RuntimeError("Recovery replay cannot access an existing file descriptor")
+        if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND):
+            paths = [path]
+    elif event in {"os.remove", "os.rmdir", "os.mkdir", "os.chmod", "os.truncate", "os.utime"}:
+        paths = [args[0]]
+    elif event in {"os.rename", "os.replace"}:
+        paths = list(args[:2])
+    for path in paths:
+        resolved = os.path.realpath(os.fsdecode(path))
+        if not resolved.startswith("/workspace/"):
+            REPLAY.violation = event
+            raise RuntimeError("Recovery replay blocked write outside /workspace")
+
+
+def execute_operation(payload):
+    operation_id = payload.get("operation_id")
+    if not operation_id:
+        with EXECUTION_LOCK:
+            return execute_payload(payload)
+    fingerprint = hashlib.sha256(json.dumps(
+        {k: payload.get(k) for k in ("code", "visual", "replay")}, sort_keys=True,
+    ).encode()).hexdigest()
+    with OPERATIONS_LOCK:
+        previous = OPERATIONS.get(operation_id)
+        if previous:
+            if previous["fingerprint"] != fingerprint:
+                raise ValueError("operation_id reused for different code")
+            return dict(previous)
+        OPERATIONS[operation_id] = {"state": "running", "fingerprint": fingerprint}
+    with EXECUTION_LOCK:
+        REPLAY.active = bool(payload.get("replay"))
+        REPLAY.violation = ""
+        try:
+            result = execute_payload(payload)
+            if REPLAY.violation:
+                result["replay_blocked"] = REPLAY.violation
+        finally:
+            REPLAY.active = False
+    with OPERATIONS_LOCK:
+        OPERATIONS[operation_id] = {"state": "completed", "fingerprint": fingerprint, "result": result}
+        return dict(OPERATIONS[operation_id])
 
 
 def prepare_vision(payload):
@@ -133,6 +201,15 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self):  # noqa: N802
+        if self.path.startswith("/operations/"):
+            operation_id = self.path.removeprefix("/operations/")
+            with OPERATIONS_LOCK:
+                body = json.dumps(OPERATIONS.get(operation_id, {"state": "unknown"})).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path != "/health":
             self.send_error(404)
             return
@@ -149,7 +226,7 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length) or b"{}")
             body = json.dumps(
-                prepare_vision(payload) if self.path == "/prepare-vision" else execute_payload(payload),
+                prepare_vision(payload) if self.path == "/prepare-vision" else execute_operation(payload),
                 ensure_ascii=False,
             ).encode("utf-8")
             self.send_response(200)
@@ -162,5 +239,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    sys.addaudithook(replay_audit)
     port = int(os.getenv("SANDBOX_PYTHON_WORKER_PORT", "18080"))
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()

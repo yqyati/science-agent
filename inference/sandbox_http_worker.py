@@ -90,6 +90,13 @@ class Handler(BaseHTTPRequestHandler):
                             result = {"status_code": exc.code, "text": exc.read().decode("utf-8", errors="replace")[:1000]}
                         except Exception as exc:
                             result = {"status_code": 599, "text": f"{type(exc).__name__}: {exc}"}
+                    if payload.get("recovery_backup") and result.get("page", {}).get("path"):
+                        # Internal transport only; the gateway removes this before
+                        # returning the normal page description to the model.
+                        result["recovery_files"] = {
+                            str(folder / name): (folder / name).read_text(encoding="utf-8")
+                            for name in ("content.md", "source.json")
+                        }
                 body = json.dumps(result, ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")

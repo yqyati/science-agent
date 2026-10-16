@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import httpx
-from sandbox_gateway import sandbox_run_scope
+from sandbox_gateway import sandbox_run_scope, take_recovery_notice
 from openai import APIConnectionError, APIError, APITimeoutError, OpenAI
 from qwen_agent.agents.fncall_agent import FnCallAgent
 from qwen_agent.llm import BaseChatModel
@@ -35,6 +35,10 @@ from deepseek_v4_config import (
 )
 from science_agent.tracing import emit_trace
 from science_agent.tool_call_parsing import extract_text_tool_calls
+from science_agent.eval.answer_extraction import (
+    find_boxed_spans,
+    last_anchored_final_answer_region,
+)
 from tool_search_mcp_r1 import Search
 from tool_visit_mcp_r1 import Visit
 from tool_runtime_registry import compat_tool_schemas_for_base_url
@@ -3008,7 +3012,20 @@ class MultiTurnReactAgent(FnCallAgent):
     def _extract_terminal_answer(self, text: str) -> str:
         answer_block = self._extract_answer_block(text)
         if answer_block:
+            # The downstream HLE selector needs a terminal-region marker to
+            # retain multiple boxes after we remove the <answer> wrapper.
+            if (len(find_boxed_spans(answer_block)) > 1
+                    and last_anchored_final_answer_region(answer_block) is None):
+                return "Final Answer:\n" + answer_block
             return answer_block
+
+        # Inspect the visible final response, not a draft in raw Qwen thinking.
+        visible = self._clean_limit_apology(text).rsplit("</think>", 1)[-1]
+        final_region = last_anchored_final_answer_region(visible)
+        if final_region and len(find_boxed_spans(final_region.content)) > 1:
+            # Keep the marker: returning just the boxes would let the adapter
+            # apply its last-box fallback a second time and lose answers again.
+            return "Final Answer:\n" + final_region.content
 
         boxed = self._extract_last_boxed(text)
         if boxed:
@@ -3444,6 +3461,12 @@ class MultiTurnReactAgent(FnCallAgent):
                             error_type=type(exc).__name__,
                             error=str(exc),
                         )
+                    recovery_notice = take_recovery_notice()
+                    if recovery_notice:
+                        if isinstance(tool_response, list):
+                            tool_response = [{"type": "text", "text": recovery_notice}] + tool_response
+                        else:
+                            tool_response = recovery_notice + "\n\n" + tool_content_to_text(tool_response)
                     schema_name = (
                         self._schema_tool_name(tool_name)
                         if hasattr(self, "_schema_tool_name")

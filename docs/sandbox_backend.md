@@ -4,6 +4,19 @@ This harness copy uses one Sandbox per Agent run. Python, search, visit, and
 readpage summary HTTP requests reuse that instance. The gateway mode is opt-in;
 other backends keep their existing behavior.
 
+## Multiple final answers
+
+ReAct preserves all boxed answers in an explicit final `Final Answer:` region,
+including when the model omits `<answer>` tags. It retains the region marker so
+the downstream HLE selector does not fall back to the last box. Multiple boxes
+inside an explicit `<answer>` block receive the same marker when needed.
+Single answers and unmarked last-box fallbacks retain their existing behavior.
+
+`tests/test_terminal_answer_extraction.py` covers the ReAct-to-HLE extraction
+chain using the actual adapter function when the adjacent Molt checkout exists.
+Changing extraction does not update already loaded processes or saved grades;
+existing runs require extraction from saved full responses and rejudging.
+
 ## Local configuration and login
 
 `sandbox.local.env` stores local API settings and is ignored by Git. If it does
@@ -287,3 +300,67 @@ Validation: 34 Sandbox tests passed, including budget placeholder rejection,
 real-answer grading after budget exhaustion, and propagation through judge,
 empty-answer, and F1 branches. Molt compileall passed; its full pytest suite
 could not run because pytest is absent on this host.
+
+## Experimental recovery after a Sandbox becomes inactive
+
+Recovery is enabled by default for new tasks. Set
+`SCIENCE_AGENT_SANDBOX_RECOVERY=0` before startup to disable it. This does not
+update already-loaded processes or pinned
+runtime snapshots. `SCIENCE_AGENT_SANDBOX_RECOVERY_DIR` selects the host backup
+root; otherwise it is `$OUTPUT_ROOT/sandbox_recovery` (or `/tmp/sandbox_recovery`
+without an output directory). Each task gets a private UUID directory. Use a
+persistent output directory for retained diagnostics. Backups contain agent code
+and page/input content, not gateway tokens or HTTP authorization headers; apply
+the same retention/access policy as rollout artifacts.
+
+The gateway journals Python dispatch and completion, including calls that return
+Python exceptions (they may already have modified globals). Page reads transport
+full `content.md` and `source.json` to the host before returning the usual short
+page description. Uploaded visual inputs are backed up too. These file and code
+events are replayed in order, preserving paths and original page contents without
+fetching the pages again. Files created by Python are recreated by replay, not
+independently snapshotted. Backup blobs are content-addressed and checked on read.
+
+Only a management endpoint's explicit `SANDBOX_NOT_ACTIVE` or sandbox-not-found
+response initiates replacement. Ordinary 503s, Python exceptions, DNS errors and
+ambiguous timeouts do not. Replacement uses the original creation options and
+clears worker/input caches. At most two replacements are attempted per task
+(`SCIENCE_AGENT_SANDBOX_RECOVERY_MAX`). Python replay has a 120-second budget
+(`SCIENCE_AGENT_SANDBOX_REPLAY_TIMEOUT`) after creation; this is checked between
+events and bounds Python requests, but management/file-transfer requests retain
+their existing individual timeouts, so it is not a hard wall-clock deadline.
+
+Each recorded Python call gets an operation ID. The worker retains running or
+completed results in memory and rejects reuse for different code. After a lost
+response the next tool call queries that operation: no new stateful request is
+sent until its outcome is known. A recovered result is returned as a notice for
+the model to review; the newly requested operation is not dispatched. If the
+instance dies while an operation is uncertain, replay stops at that event.
+
+During replay, a Python audit hook rejects network/process operations and writes
+outside `/workspace`; a caught audit violation still marks replay unsuccessful.
+This is a guard for ordinary agent code, **not a security boundary for hostile
+Python or arbitrary native extensions**. Shell commands, downloads, package
+installation and some library imports may therefore prevent full recovery.
+Visual Python execution is a replay barrier in this initial version, although its
+input files are retained. Output/error/image digests must match the original
+call. Matching output does not prove identical hidden state: random numbers,
+time, external state and nondeterministic computations can still differ.
+
+On any barrier, output difference or timeout, replay stops, records incomplete
+recovery and reports the number of restored Python calls. The failing call may
+have partially modified state. The model receives the recovery notice at the
+ReAct tool-message boundary, ahead of ordinary output; inner tool retries cannot
+continue while that notice is pending. The interrupted request is not
+transparently retried. Agent-facing recovery notices contain factual status only: recovery scope,
+failure category, and execution outcome. They contain no instructions or
+recommendations about the agent’s next action. Raw recovery exception messages
+are not interpolated into these notices. Future replacements stop at a recorded prior
+incomplete-recovery barrier as well. No conversation or historical tool output is
+replayed into the model context.
+
+The journal is currently used by the same live Agent process; resuming a crashed
+host process from the journal is not implemented. Python-worker-only restarts
+while the platform still reports an active instance are not automatically
+recovered. Judge-only replacement continues to use the existing adapter path;
+it does not require restoring a solver's Python state.
