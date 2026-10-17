@@ -1,4 +1,5 @@
 import ast
+from contextlib import nullcontext
 import io
 import json
 import os
@@ -81,6 +82,27 @@ class PageTests(unittest.TestCase):
             self.assertEqual(worker.save_page(self.payload, "blocked text"), {"blocked": True})
         self.assertFalse(Path("pages").exists())
 
+    def test_inline_character_boundary_with_cache_and_recovery(self):
+        for length in (5999, 6000, 6001):
+            with self.subTest(length=length):
+                text = "字" * length
+                payload = dict(self.payload, source_url=f"https://source/{length}", recovery_backup=True)
+                with patch.object(worker, "urlopen") as fetch:
+                    fetch.return_value.__enter__.return_value = SimpleNamespace(status=200, read=lambda: text.encode())
+                    first = self.request(payload)
+                    cached = self.request(payload)
+                fetch.assert_called_once()
+                for result in (first, cached):
+                    page = result["page"]
+                    self.assertEqual(Path(page["path"]).read_text(encoding="utf-8"), text)
+                    self.assertEqual(result["recovery_files"][page["path"]], text)
+                    self.assertEqual(page["preview"], text[:1000])
+                    if length <= 6000:
+                        self.assertEqual(result["text"], text)
+                    else:
+                        self.assertNotIn("text", result)
+
+
     def test_recovery_transport_includes_full_original_and_cached_page(self):
         text = "original evidence\n" * 1000
         with patch.object(worker, "urlopen") as fetch:
@@ -102,7 +124,10 @@ class PageTests(unittest.TestCase):
         calls = []
         def run_http(payload, **kwargs):
             calls.append(payload)
-            return {"status_code": 200, "page": page}
+            result = {"status_code": 200, "page": page}
+            if page["characters"] <= 6000:
+                result["text"] = "字" * page["characters"]
+            return result
         namespace = {
             "os": os, "json": json, "time": __import__("time"), "emit_trace": lambda *a, **k: None,
             "shared_sandbox_run": lambda: SimpleNamespace(run_http=run_http),
@@ -119,6 +144,48 @@ class PageTests(unittest.TestCase):
         self.assertTrue(calls[0]["save_page"])
         self.assertIn("guard_snapshot", calls[0])
         self.assertNotIn("tiktoken", source.read_text())
+        with patch.dict(os.environ, {"SCIENCE_AGENT_READ_PAGE_MODE": "file", "SCIENCE_AGENT_TOOL_HTTP_BACKEND": "gateway_sandbox"}):
+            for length in (5999, 6000, 6001):
+                page["characters"] = length
+                returned = namespace["readpage_jina"](agent, "https://source/test", "find evidence")
+                if length <= 6000:
+                    self.assertEqual(returned, "字" * length)
+                else:
+                    self.assertEqual(json.loads(returned)["path"], page["path"])
+
+    def test_public_call_preserves_inline_whitespace_and_cache(self):
+        source = ROOT / "inference/tool_visit_mcp_r1.py"
+        tree = ast.parse(source.read_text())
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Visit")
+        methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in {"call", "readpage_jina"}]
+        from typing import Union, List
+        namespace = dict(os=os, json=json, time=__import__("time"), Union=Union, List=List,
+                         emit_trace=lambda *a, **k: None, normalize_url_input=lambda x: x,
+                         guard_capture_item_scope=lambda *a, **k: nullcontext(),
+                         guard_capture_url_scope=lambda *a, **k: nullcontext(),
+                         is_url_blocked=lambda _: False, provider_strategy=lambda: "original",
+                         capture_structured_basis=lambda *a, **k: None, GUARD_FORMAT_VISIT_FINAL_V1="test",
+                         shared_sandbox_run=lambda: SimpleNamespace(run_http=lambda payload, **kw: self.request(payload)),
+                         current_guard_context=lambda: capture_guard_context({}), guard_fingerprint=guard_fingerprint,
+                         _visit_read_max_retries=lambda: 1, tool_http_config=lambda _: {"max_time": 30})
+        exec(compile(ast.Module(body=methods, type_ignores=[]), str(source), "exec"), namespace)
+        agent = SimpleNamespace(_build_jina_request=lambda url: ("https://reader/test", {}))
+        agent.readpage_jina = lambda *args: namespace["readpage_jina"](agent, *args)
+        with patch.dict(os.environ, {"SCIENCE_AGENT_READ_PAGE_MODE": "file", "SCIENCE_AGENT_TOOL_HTTP_BACKEND": "gateway_sandbox"}):
+            for length in (5999, 6000, 6001):
+                text = "  " + "字" * (length - 4) + "\n\n"
+                with patch.object(worker, "urlopen") as fetch:
+                    fetch.return_value.__enter__.return_value = SimpleNamespace(status=200, read=lambda: text.encode())
+                    params = {"url": f"https://source/whitespace/{length}", "goal": "evidence"}
+                    first = namespace["call"](agent, params)
+                    cached = namespace["call"](agent, params)
+                fetch.assert_called_once()
+                if length <= 6000:
+                    self.assertEqual(first, text)
+                    self.assertEqual(cached, text)
+                else:
+                    self.assertEqual(json.loads(first)["preview"], text[:1000])
+                    self.assertTrue(json.loads(cached)["cached"])
 
     def test_python_gateway_uses_existing_observation_limit(self):
         source = ROOT / "inference/tool_python.py"

@@ -26,9 +26,12 @@ def _postprocess_remote_search(tool_key: str, content: Any) -> Any:
     max_results_name = "SCIENCE_AGENT_SCHOLAR_MAX_RESULTS" if tool_key == "google_scholar" else "SCIENCE_AGENT_SEARCH_MAX_RESULTS"
     snippet_name = "SCIENCE_AGENT_SCHOLAR_SNIPPET_CHARS" if tool_key == "google_scholar" else "SCIENCE_AGENT_SEARCH_SNIPPET_CHARS"
     try:
-        max_results = max(1, int(os.environ.get(max_results_name, "6")))
-        snippet_chars = max(100, int(os.environ.get(snippet_name, "700")))
+        max_results = max(0, int(os.environ.get(max_results_name, "0" if tool_key == "google_scholar" else "10")))
+        snippet_chars = max(0, int(os.environ.get(snippet_name, "0")))
     except (TypeError, ValueError):
+        return content
+
+    if max_results == 0 and snippet_chars == 0:
         return content
 
     entry_re = re.compile(r"^\s*\d+\.\s+(?:\*\*)?\[(?P<title>[^\]]+)\]\((?P<link>[^)]+)\)(?:\*\*)?\s*$")
@@ -54,10 +57,10 @@ def _postprocess_remote_search(tool_key: str, content: Any) -> Any:
             continue
         seen_links.add(link)
         clean_body = re.sub(r"\s+", " ", " ".join(part.strip() for part in body if part.strip())).strip()
-        if len(clean_body) > snippet_chars:
+        if snippet_chars > 0 and len(clean_body) > snippet_chars:
             clean_body = clean_body[:snippet_chars].rsplit(" ", 1)[0].rstrip() + "..."
         selected.append((title, link, clean_body))
-        if len(selected) >= max_results:
+        if max_results > 0 and len(selected) >= max_results:
             break
 
     lines = content.splitlines()

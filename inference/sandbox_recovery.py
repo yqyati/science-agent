@@ -20,6 +20,9 @@ class RecoveryJournal:
             stream.write(json.dumps(event, ensure_ascii=False) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
+        if event["kind"] == "python_session_reset":
+            # Disk keeps the audit trail; recovery uses only the current session.
+            self.events = [item for item in self.events if item["kind"] == "file"]
         self.events.append(event)
 
     def file(self, path, content):

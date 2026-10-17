@@ -256,8 +256,9 @@ class Visit(BaseTool):
     description = (
         "Fetch a known webpage URL after search or when a URL is given. In Sandbox file mode, "
         "save the complete reader-provided Markdown under pages/ in this Agent's working directory. "
-        "Return the file path, source URL, character/line counts, and a short preview; "
-        "the response is not the full page and no LLM summary is generated. "
+        "Return the complete Markdown directly for pages of at most 6000 characters. "
+        "For longer pages, return the file path, source URL, character/line counts, "
+        "and the first 1000 characters as a preview. No LLM summary is generated. "
         "Python already starts in /workspace. Pass the returned path directly to open() or Path().read_text() "
         "with UTF-8; for example, Path('pages/<page_id>/content.md').read_text(encoding='utf-8'). "
         "Do not prepend /workspace or use an absolute path; the Python tool requires relative paths. "
@@ -350,7 +351,7 @@ class Visit(BaseTool):
             response = "\n=======\n".join(response)
         
         print(f'Read page response chars: {len(response)}')
-        return response.strip()
+        return response if os.getenv("SCIENCE_AGENT_READ_PAGE_MODE", "").strip().lower() == "file" else response.strip()
         
     def call_server(self, msgs, max_retries=2):
         global successful_calls_summarize, failed_calls_summarize, SUMMARY_CACHE_FILE
@@ -605,6 +606,8 @@ class Visit(BaseTool):
                             return blocked_visit_message()
                         emit_trace("read_page_saved", layer="tool_visit", url=url,
                                    path=page["path"], page_chars=page["characters"], cached=page.get("cached", False))
+                        if page["characters"] <= 6000 and "text" in result:
+                            return result["text"]
                         return json.dumps(dict(page, instruction="This is a file description and preview, not the full page. Python already starts in /workspace. Read path exactly as returned with UTF-8; do not prepend /workspace or use absolute paths. Print relevant original lines with line numbers and context. If output is truncated, read smaller line ranges."), ensure_ascii=False)
                     error = f"HTTP {result['status_code']}: {result.get('text', '')[:500]}"
                 except Exception as exc:

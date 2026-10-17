@@ -226,9 +226,11 @@ The Sandbox launcher defaults to SCIENCE_AGENT_READ_PAGE_MODE=file.
 read_page(url, goal) requests Jina from the Sandbox HTTP worker and stores
 the complete returned Markdown in /workspace/pages/<URL-hash>/content.md.
 source.json records the source/reader URLs, timestamp, length, preview, and
-evaluation guard fingerprint. The observation contains only metadata and
-a preview of at most 1000 characters. The host receives no full page text,
-and the file branch does not invoke tokenization or a summary model.
+evaluation guard fingerprint. Pages of at most 6000 Unicode characters return
+the complete Markdown directly. Longer pages return metadata, the saved file
+path, and the first 1000 characters as a preview. Both sizes retain the complete
+file and recovery backup; cached visits follow the same length rule. The file
+branch does not invoke tokenization or a summary model.
 The isolated Visit module no longer imports tiktoken or downloads encodings.
 
 The existing evaluation URL/text guard snapshot is evaluated in the worker
@@ -251,7 +253,7 @@ for index, line in enumerate(lines):
 ```
 
 The gateway Python branch now uses the existing observation truncation
-helper, with launcher default PYTHON_TOOL_RETURN_MAX_CHARS=6000. Full files
+helper, with launcher default PYTHON_TOOL_RETURN_MAX_CHARS=50000. Full files
 remain available for additional slices. /workspace is a working directory,
 not a filesystem security boundary; Python can still access permitted
 Sandbox system paths. No host shared-storage mount is added.
@@ -330,12 +332,34 @@ clears worker/input caches. At most two replacements are attempted per task
 events and bounds Python requests, but management/file-transfer requests retain
 their existing individual timeouts, so it is not a hard wall-clock deadline.
 
-Each recorded Python call gets an operation ID. The worker retains running or
-completed results in memory and rejects reuse for different code. After a lost
-response the next tool call queries that operation: no new stateful request is
-sent until its outcome is known. A recovered result is returned as a notice for
-the model to review; the newly requested operation is not dispatched. If the
-instance dies while an operation is uncertain, replay stops at that event.
+Each recorded Python call gets an operation ID. With recovery enabled (the
+default), an unavailable execution response first triggers a result lookup. A
+completed result is reused without executing code twice. Otherwise the worker
+receives a cooperative interrupt request. The gateway polls for up to five
+seconds; if execution still has not completed, it terminates the identified
+worker process group and starts a fresh worker in the same Sandbox. Process ID,
+start time and new-worker identity are checked before reporting a successful
+restart. Individual network/management request timeouts can extend this wait.
+
+A successful interrupt retains the namespace and any partial modifications. A
+restart clears Python memory, retains Sandbox files (including partial writes),
+and does not replay code. Interrupted calls are excluded from recovery history.
+After a confirmed restart, the active code history is cleared; file backups and
+new-session code remain available. The on-disk log retains the audit trail.
+Subsequent whole-Sandbox recovery reports partial restoration when interrupted
+state or earlier-session generated files were not backed up. Ordinary Python
+exceptions remain replayable. Failed termination/startup reports unconfirmed
+state and blocks new Python work, rather than reporting success.
+
+HTTP-only requests, including search, can proceed without consuming Python
+state. Pending recovery notices gate all tools until returned to the model.
+Search and Scholar return state errors directly without transport retries or
+host fallback. Interrupt/restart notices describe facts without instructions.
+External side effects and detached subprocesses cannot be assumed undone.
+
+Tool responses are passed to the model without an appended remaining-token
+notice, matching the historical harness. Internal token accounting and configured
+context/trajectory limits still apply.
 
 During replay, a Python audit hook rejects network/process operations and writes
 outside `/workspace`; a caught audit violation still marks replay unsuccessful.
@@ -360,7 +384,12 @@ incomplete-recovery barrier as well. No conversation or historical tool output i
 replayed into the model context.
 
 The journal is currently used by the same live Agent process; resuming a crashed
-host process from the journal is not implemented. Python-worker-only restarts
-while the platform still reports an active instance are not automatically
-recovered. Judge-only replacement continues to use the existing adapter path;
+host process from the journal is not implemented. Timeout-triggered worker
+restarts create an empty session; they do not restore the previous namespace.
+Judge-only replacement continues to use the existing adapter path;
 it does not require restoring a solver's Python state.
+
+Search defaults match the historical harness: 10 web results, all Scholar results,
+and no additional snippet truncation. `SCIENCE_AGENT_SEARCH_SNIPPET_CHARS=0` and
+`SCIENCE_AGENT_SCHOLAR_SNIPPET_CHARS=0` disable snippet limits;
+`SCIENCE_AGENT_SCHOLAR_MAX_RESULTS=0` returns all provider entries.

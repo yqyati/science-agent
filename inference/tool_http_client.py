@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import requests
-from sandbox_gateway import SandboxGatewayError, shared_sandbox_run, close_shared_sandbox_run
+from sandbox_gateway import SandboxGatewayError, SandboxStateError, shared_sandbox_run, close_shared_sandbox_run
 
 from runtime_env import get_env_bool, get_env_float, get_env_value
 
@@ -286,6 +286,8 @@ def tool_http_request(
     if os.getenv("SCIENCE_AGENT_TOOL_HTTP_BACKEND", "").strip().lower() == "gateway_sandbox":
         try:
             return _sandbox_http_request(method=method, url=url, headers=headers, json_payload=json_payload)
+        except SandboxStateError:
+            raise
         except SandboxGatewayError:
             if os.getenv("SCIENCE_AGENT_SANDBOX_HTTP_STRICT", "true").strip().lower() in {"1", "true", "yes", "on"}:
                 raise

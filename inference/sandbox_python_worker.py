@@ -19,6 +19,9 @@ import sys
 import traceback
 import threading
 import hashlib
+import signal
+import time
+from pathlib import Path
 from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -28,6 +31,12 @@ EXECUTION_LOCK = threading.Lock()
 OPERATIONS_LOCK = threading.Lock()
 OPERATIONS = {}
 REPLAY = threading.local()
+INTERRUPTS = {}
+WORKER_ID = ""
+
+
+class ExecutionInterrupted(BaseException):
+    pass
 
 
 def replay_audit(event, args):
@@ -78,11 +87,23 @@ def execute_operation(payload):
                 raise ValueError("operation_id reused for different code")
             return dict(previous)
         OPERATIONS[operation_id] = {"state": "running", "fingerprint": fingerprint}
+        interrupted = INTERRUPTS[operation_id] = threading.Event()
     with EXECUTION_LOCK:
         REPLAY.active = bool(payload.get("replay"))
         REPLAY.violation = ""
         try:
-            result = execute_payload(payload)
+            def check_interrupt(frame, event, arg):
+                if interrupted.is_set() and frame.f_code.co_filename == "<agent>":
+                    raise ExecutionInterrupted("Python execution interrupted after response timeout")
+                return check_interrupt if frame.f_code.co_filename == "<agent>" else None
+
+            sys.settrace(check_interrupt)
+            try:
+                result = execute_payload(payload)
+            finally:
+                sys.settrace(None)
+            if interrupted.is_set():
+                result["interrupted"] = True
             if REPLAY.violation:
                 result["replay_blocked"] = REPLAY.violation
         finally:
@@ -188,7 +209,7 @@ def execute_payload(payload):
                 for number in set(pyplot.get_fignums()) - previous_figures:
                     capture(pyplot.figure(number))
                     pyplot.close(number)
-        except Exception:
+        except (Exception, ExecutionInterrupted, KeyboardInterrupt, SystemExit):
             error = traceback.format_exc()
         finally:
             for module, name, original in reversed(patches):
@@ -210,6 +231,13 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if self.path == "/identity":
+            body = WORKER_ID.encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path != "/health":
             self.send_error(404)
             return
@@ -219,6 +247,18 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"ok")
 
     def do_POST(self):  # noqa: N802
+        if self.path.startswith("/interrupt/"):
+            operation_id = self.path.removeprefix("/interrupt/")
+            with OPERATIONS_LOCK:
+                state = OPERATIONS.get(operation_id, {}).get("state", "unknown")
+                if state == "running":
+                    INTERRUPTS[operation_id].set()
+            body = json.dumps({"state": state}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path not in {"/execute", "/prepare-vision"}:
             self.send_error(404)
             return
@@ -239,6 +279,34 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--identity", default="")
+    parser.add_argument("--stop", default="")
+    args = parser.parse_args()
+    if args.stop:
+        # Only terminate the recorded process group, after checking PID reuse.
+        record = json.loads(Path(f"/tmp/agent-python-{args.stop}.json").read_text())
+        pid = record["pid"]
+        proc = Path(f"/proc/{pid}/stat")
+        if proc.exists():
+            stat = proc.read_text().split(") ", 1)[1].split()
+            if stat[19] != record["start"] or os.getpgid(pid) != pid:
+                raise RuntimeError("Python worker identity mismatch")
+            os.killpg(pid, signal.SIGKILL)
+            deadline = time.monotonic() + 5
+            while proc.exists() and proc.read_text().split(") ", 1)[1].split()[0] != "Z":
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Python worker termination unconfirmed")
+                time.sleep(0.05)
+        print(json.dumps({"stopped": args.stop}))
+        raise SystemExit(0)
+    WORKER_ID = args.identity
+    if WORKER_ID:
+        if os.getsid(0) != os.getpid():
+            os.setsid()
+        record = {"pid": os.getpid(), "start": Path(f"/proc/{os.getpid()}/stat").read_text().split(") ", 1)[1].split()[19]}
+        Path(f"/tmp/agent-python-{WORKER_ID}.json").write_text(json.dumps(record))
     sys.addaudithook(replay_audit)
     port = int(os.getenv("SANDBOX_PYTHON_WORKER_PORT", "18080"))
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()

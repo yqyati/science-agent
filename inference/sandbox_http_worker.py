@@ -90,6 +90,8 @@ class Handler(BaseHTTPRequestHandler):
                             result = {"status_code": exc.code, "text": exc.read().decode("utf-8", errors="replace")[:1000]}
                         except Exception as exc:
                             result = {"status_code": 599, "text": f"{type(exc).__name__}: {exc}"}
+                    if result.get("page", {}).get("path") and result["page"]["characters"] <= 6000:
+                        result["text"] = (folder / "content.md").read_text(encoding="utf-8")
                     if payload.get("recovery_backup") and result.get("page", {}).get("path"):
                         # Internal transport only; the gateway removes this before
                         # returning the normal page description to the model.

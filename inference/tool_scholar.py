@@ -6,6 +6,7 @@ from qwen_agent.tools.base import BaseTool, register_tool
 from concurrent.futures import ThreadPoolExecutor
 from runtime_env import get_env_float, get_env_int
 from tool_http_client import tool_http_config, tool_http_request
+from sandbox_gateway import SandboxStateError
 from tool_provider_strategy import provider_strategy, strategy_scholar
 from tool_url_guard import (
     GUARD_FORMAT_SERPER_SCHOLAR_V1,
@@ -142,6 +143,8 @@ class Scholar(BaseTool):
                     error=str(e),
                 )
                 print(e)
+                if isinstance(e, SandboxStateError):
+                    return f"Google Scholar unavailable: {e}"
                 if i == max_retries - 1:
                     if not SERPER_KEY and "google.serper.dev" in SERPER_SCHOLAR_API_URL:
                         return (
@@ -179,9 +182,9 @@ class Scholar(BaseTool):
             web_snippets = list()
             blocked_result_count = 0
             if "organic" in results:
-                max_results = max(1, int(os.environ.get("SCIENCE_AGENT_SCHOLAR_MAX_RESULTS", "6")))
-                snippet_chars = max(100, int(os.environ.get("SCIENCE_AGENT_SCHOLAR_SNIPPET_CHARS", "700")))
-                for page in results["organic"][:max_results]:
+                max_results = max(0, int(os.environ.get("SCIENCE_AGENT_SCHOLAR_MAX_RESULTS", "0")))
+                snippet_chars = max(0, int(os.environ.get("SCIENCE_AGENT_SCHOLAR_SNIPPET_CHARS", "0")))
+                for page in results["organic"][:max_results or None]:
                     if is_search_result_blocked(page):
                         blocked_result_count += 1
                         continue
@@ -200,7 +203,7 @@ class Scholar(BaseTool):
                     snippet = ""
                     if "snippet" in page:
                         snippet_text = str(page["snippet"]).strip()
-                        if len(snippet_text) > snippet_chars:
+                        if snippet_chars > 0 and len(snippet_text) > snippet_chars:
                             snippet_text = snippet_text[:snippet_chars].rsplit(" ", 1)[0] + "..."
                         snippet = "\n" + snippet_text
                     

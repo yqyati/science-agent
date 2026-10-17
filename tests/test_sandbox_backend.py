@@ -3,6 +3,7 @@ import asyncio
 import io
 import json
 import os
+import shlex
 import sys
 import unittest
 import tempfile
@@ -106,13 +107,16 @@ class FakeClient:
     def upload_file_bytes(self, _sid, path, _data):
         self.uploads.append(path)
 
-    def command(self, *_args, **_kwargs):
+    def command(self, _sid, command, **_kwargs):
+        args = shlex.split(command)
+        if "--identity" in args:
+            self.identity = args[args.index("--identity") + 1]
         return ""
 
     _shell_quote = staticmethod(gateway.SandboxGatewayClient._shell_quote)
 
-    def proxy_http(self, *_args, **_kwargs):
-        return 200, "ok"
+    def proxy_http(self, _sid, _port, path, **_kwargs):
+        return 200, self.identity if path == "/identity" else "ok"
 
     def proxy_json(self, _sid, port, _path, payload, **_kwargs):
         if _path == '/prepare-vision':

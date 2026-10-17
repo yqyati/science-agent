@@ -30,15 +30,32 @@ def _iter_string_literals(code: str) -> Iterable[str]:
         return []
 
     values: list[str] = []
-    for node in ast.walk(tree):
+    def visit(node: ast.AST) -> None:
+        # URL f-string suffixes are text, but interpolated expressions can
+        # still contain file operations whose literals need checking.
+        if isinstance(node, ast.JoinedStr) and node.values:
+            prefix = node.values[0]
+            if (
+                isinstance(prefix, ast.Constant)
+                and isinstance(prefix.value, str)
+                and prefix.value.lstrip().startswith(("http://", "https://"))
+            ):
+                for part in node.values:
+                    if isinstance(part, ast.FormattedValue):
+                        visit(part)
+                return
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             values.append(node.value)
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    visit(tree)
     return values
 
 
 def _looks_like_absolute_path(value: str) -> bool:
     stripped = value.strip()
-    if not stripped or stripped == "/":
+    if not stripped or stripped in {"/", "~"}:
         return False
     if stripped.startswith(("http://", "https://", "data:image/")):
         return False
@@ -80,8 +97,7 @@ def format_path_policy_error(tool_label: str, violations: list[PathPolicyViolati
     )
     return (
         f"[{tool_label} Error]: Path policy blocked this code before execution. "
-        "Use relative paths inside the sandbox working directory only. "
-        "Do not use /mnt, /tmp, /home, /root, or ../ paths. "
+        "The path policy permits only relative paths within the sandbox working directory. "
         f"Blocked path literal(s): {examples}"
     )
 

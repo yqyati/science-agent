@@ -36,6 +36,10 @@ class SandboxInactiveError(SandboxGatewayError):
     """Management API confirmed that the addressed Sandbox is unavailable."""
 
 
+class SandboxStateError(SandboxGatewayError):
+    """Execution state prevents dispatch; transport retries cannot resolve it."""
+
+
 class SandboxGatewayClient:
     def __init__(self, base_url: str, token: str, resource: str | None = None):
         self.base_url = base_url.rstrip("/")
@@ -274,6 +278,8 @@ class AgentSandboxRun:
         self._recovery_count = 0
         self._recovery_notice = []
         self._pending_python = None
+        self._python_worker_id = ""
+        self._python_restart_needed = False
         self._recovery_broken = False
         self._create_options = None
 
@@ -295,7 +301,7 @@ class AgentSandboxRun:
         """Called only after an explicit management-plane inactive response."""
         maximum = int(os.getenv("SCIENCE_AGENT_SANDBOX_RECOVERY_MAX", "2"))
         if self._recovery_count >= maximum:
-            raise SandboxGatewayError("Sandbox recovery limit reached; environment remains unavailable")
+            raise SandboxStateError("Sandbox recovery limit reached; environment remains unavailable")
         self._recovery_count += 1
         journal = self._get_journal()
         old_id = self.sandbox_id
@@ -304,6 +310,7 @@ class AgentSandboxRun:
         self._python_started = self._http_started = self._vision_ready = False
         self._uploaded_inputs.clear()
         self._pending_python = None
+        self._python_restart_needed = False
         self._recovery_broken = True
         restored = 0
         failure_reason = "replacement_creation_failed"
@@ -312,7 +319,8 @@ class AgentSandboxRun:
             self.ensure()
             deadline = time.monotonic() + float(os.getenv("SCIENCE_AGENT_SANDBOX_REPLAY_TIMEOUT", "120"))
             completed = {e["operation_id"]: e for e in events if e["kind"] == "python_result"}
-            cancelled = {e["operation_id"] for e in events if e["kind"] == "python_cancelled"}
+            cancelled = {e["operation_id"] for e in events if e["kind"] in {"python_cancelled", "python_interrupted"}}
+            partial_history = any(e["kind"] in {"python_interrupted", "python_session_reset"} for e in events)
             for event in events:
                 failure_reason = "replay_time_budget_exhausted"
                 remaining = deadline - time.monotonic()
@@ -349,10 +357,13 @@ class AgentSandboxRun:
                             failure_reason = "python_replay_operation_blocked"
                         raise SandboxGatewayError("Python replay output differs from the saved result")
                     restored += 1
-            self._recovery_broken = False
+            self._recovery_broken = partial_history
             notice = (f"[Sandbox recovery] Environment replaced. Restored files and replayed {restored} Python calls "
                       "with matching recorded outputs. Hidden-state equivalence is unverified. "
                       "The current request was not completed.")
+            if partial_history:
+                notice += (" Recovery is partial: interrupted code and earlier-session code were not replayed. "
+                           "Their unbacked file changes and interrupted memory changes are not restored.")
         except Exception as exc:
             journal.record({"kind": "barrier", "reason": type(exc).__name__})
             notice = (f"[Sandbox recovery] Recovery incomplete; replacement_available={bool(self.sandbox_id)}; "
@@ -368,7 +379,7 @@ class AgentSandboxRun:
                 self.client.delete(old_id)
         except Exception:
             logging.getLogger(__name__).warning("Could not clean replaced Sandbox id=%s", old_id)
-        raise SandboxGatewayError(notice)
+        raise SandboxStateError(notice)
 
     @property
     def enabled(self) -> bool:
@@ -513,13 +524,22 @@ class AgentSandboxRun:
                 guard_file = os.path.join(os.path.dirname(__file__), "tool_url_guard.py")
                 with open(guard_file, "rb") as handle:
                     self.client.upload_file_bytes(sandbox_id, "/tmp/tool_url_guard.py", handle.read())
-            self.client.command(sandbox_id, f"cd /workspace && nohup python3 {self.client._shell_quote(worker)} >/tmp/agent-{kind}-worker.log 2>&1 &", timeout=30)
+            arguments = ""
+            if kind == "python":
+                self._python_worker_id = uuid.uuid4().hex
+                arguments = " --identity " + self._python_worker_id
+            self.client.command(sandbox_id, f"cd /workspace && nohup python3 {self.client._shell_quote(worker)}{arguments} >/tmp/agent-{kind}-worker.log 2>&1 &", timeout=30)
             deadline = time.monotonic() + float(os.getenv("SCIENCE_AGENT_SANDBOX_WORKER_START_TIMEOUT", "30"))
             last_error = "not ready"
             while time.monotonic() < deadline:
                 try:
                     status, body = self.client.proxy_http(sandbox_id, port, "/health", timeout=5)
                     if status == 200 and body == "ok":
+                        if kind == "python":
+                            identity_status, identity = self.client.proxy_http(sandbox_id, port, "/identity", timeout=5)
+                            if identity_status != 200 or identity != self._python_worker_id:
+                                time.sleep(0.5)
+                                continue
                         setattr(self, flag, True)
                         return sandbox_id
                     last_error = f"HTTP {status}"
@@ -534,7 +554,10 @@ class AgentSandboxRun:
         if self._recovery_enabled:
             with self._worker_lock:
                 try:
-                    self._resolve_pending()
+                    # HTTP-only requests do not consume Python state. Page writes
+                    # retain execution ordering; recovery notices gate all tools.
+                    if self._recovery_notice or payload.get("save_page"):
+                        self._resolve_pending()
                     sid = self._start_worker("http", 18081)
                     request = dict(payload, timeout=timeout, recovery_backup=bool(payload.get("save_page")))
                     data = self.client.proxy_json(sid, 18081, "/request", request, timeout=timeout + 10)
@@ -576,20 +599,71 @@ class AgentSandboxRun:
         if self._recovery_notice:
             # Tool wrappers may retry internally. The agent must see the reset
             # notice before any wrapper can dispatch more stateful work.
-            raise SandboxGatewayError("Sandbox status changed; pending recovery notice. Current request was not dispatched")
+            raise SandboxStateError("Sandbox status changed; pending recovery notice. Current request was not dispatched")
         if self._pending_python is None:
             return
         operation_id = self._pending_python
+        if self._python_restart_needed:
+            self._restart_python()
         status, body = self.client.proxy_http(self.sandbox_id, 18080, "/operations/" + operation_id, timeout=10)
         result = json.loads(body) if status == 200 else {}
         if result.get("state") != "completed":
-            raise SandboxGatewayError("Previous Python call is running or its outcome is unknown; no new operation was sent")
+            raise SandboxStateError("Previous Python call is running or its outcome is unknown; no new operation was sent")
         self._get_journal().record({"kind": "python_result", "operation_id": operation_id,
                                    "sha256": result_digest(result["result"])})
         self._pending_python = None
         self._recovery_notice.append("[Sandbox execution] The previously timed-out Python call completed. Saved output:\n" +
                                      str(result["result"].get("stdout", ""))[:3000] + str(result["result"].get("error", ""))[:1000])
-        raise SandboxGatewayError("Previous Python result recovered; current request was not executed.")
+        raise SandboxStateError("Previous Python result recovered; current request was not executed.")
+
+    def _restart_python(self):
+        self._python_restart_needed = True
+        worker = os.getenv("SCIENCE_AGENT_SANDBOX_PYTHON_WORKER", "/tmp/sandbox_python_worker.py")
+        identity = self._python_worker_id
+        try:
+            if not identity:
+                raise SandboxGatewayError("Python worker identity unavailable")
+            command = "python3 " + self.client._shell_quote(worker) + " --stop " + self.client._shell_quote(identity)
+            raw = self.client.command(self.sandbox_id, command, timeout=15)
+            confirmation = json.loads(self.client.command_output(raw))
+            if confirmation.get("stopped") != identity:
+                raise SandboxGatewayError("Python worker termination unconfirmed")
+            self._python_started = self._vision_ready = False
+            self._start_worker("python", 18080)
+            self._get_journal().record({"kind": "python_session_reset"})
+        except SandboxInactiveError:
+            raise
+        except Exception as exc:
+            raise SandboxStateError("Python interruption did not complete; session restart unconfirmed. "
+                                    "Execution and memory state are unknown. error_type=" + type(exc).__name__) from exc
+        self._pending_python = None
+        self._python_restart_needed = False
+        notice = ("[Sandbox execution] Python session restarted after interruption did not complete. "
+                  "The previous worker was terminated. Memory state was cleared; sandbox files were retained "
+                  "and may contain partial writes. Historical code was not replayed. External operation outcomes are unverified.")
+        self._recovery_notice.append(notice)
+        raise SandboxStateError(notice)
+
+    def _interrupt_python(self):
+        operation_id = self._pending_python
+        try:
+            status, body = self.client.proxy_http(self.sandbox_id, 18080, "/operations/" + operation_id, timeout=5)
+            data = json.loads(body) if status == 200 else {}
+            if data.get("state") == "completed":
+                return data
+            self.client.proxy_json(self.sandbox_id, 18080, "/interrupt/" + operation_id, {}, timeout=5)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                status, body = self.client.proxy_http(self.sandbox_id, 18080, "/operations/" + operation_id, timeout=2)
+                data = json.loads(body) if status == 200 else {}
+                if data.get("state") == "completed":
+                    return data
+                time.sleep(0.1)
+        except SandboxInactiveError:
+            raise
+        except (SandboxGatewayError, urllib.error.URLError, TimeoutError, ValueError):
+            pass
+        self._restart_python()
 
     def _execute_recorded(self, payload, timeout):
         self._resolve_pending()
@@ -606,11 +680,17 @@ class AgentSandboxRun:
             journal.record({"kind": "python_cancelled", "operation_id": operation_id})
             self._pending_python = None
             raise
-        except (SandboxGatewayError, urllib.error.URLError, TimeoutError) as exc:
-            raise SandboxGatewayError("Python response unavailable; execution outcome is pending.") from exc
+        except (SandboxGatewayError, urllib.error.URLError, TimeoutError):
+            data = self._interrupt_python()
         if data.get("state") != "completed":
-            raise SandboxGatewayError("Python execution still running; result is pending")
+            data = self._interrupt_python()
         result = data["result"]
+        if result.get("interrupted"):
+            journal.record({"kind": "python_interrupted", "operation_id": operation_id})
+            self._recovery_notice.append(
+                "[Sandbox execution] Python execution was interrupted after response timeout. "
+                "The session was retained. Variables and files may contain changes made before interruption. "
+                "External operation outcomes are unverified.")
         journal.record({"kind": "python_result", "operation_id": operation_id, "sha256": result_digest(result)})
         self._pending_python = None
         return result

@@ -3,6 +3,7 @@
 import argparse
 import base64
 import io
+import hashlib
 import json
 import os
 import sys
@@ -126,7 +127,15 @@ def main():
             from tool_visit_mcp_r1 import Visit
             tool = Visit()
             url = "http://example.com"
-            metadata = json.loads(tool.call({"url": url, "goal": "Find the page title"}))
+            returned = tool.call({"url": url, "goal": "Find the page title"})
+            page_id = hashlib.sha256(url.encode()).hexdigest()[:20]
+            metadata = json.loads(run.run_python(
+                f"from pathlib import Path\nprint(Path('pages/{page_id}/source.json').read_text(encoding='utf-8'))"))
+            if metadata["characters"] <= 6000:
+                assert len(returned) == metadata["characters"]
+                assert returned[:1000] == metadata["preview"]
+            else:
+                assert json.loads(returned)["path"] == metadata["path"]
             assert "absolute_path" not in metadata
             assert metadata["path"].startswith("pages/") and not Path(metadata["path"]).is_absolute()
             path = metadata["path"]
@@ -135,14 +144,19 @@ def main():
                                     "assert len(text) == " + str(metadata["characters"]) + "\n" +
                                     "print('saved page evidence:', text[:300])")
             assert "saved page evidence:" in output, output
-            repeated = json.loads(tool.call({"url": url, "goal": "Read again"}))
-            assert repeated["cached"] and repeated["path"] == path
+            repeated = tool.call({"url": url, "goal": "Read again"})
+            if metadata["characters"] <= 6000:
+                assert repeated == returned
+            else:
+                repeated = json.loads(repeated)
+                assert repeated["cached"] and repeated["path"] == path
             from tool_python import PythonInterpreter
             python_tool = PythonInterpreter()
             evidence = python_tool.call({"code": "from pathlib import Path\nprint(Path(" + repr(path) + ").read_text(encoding='utf-8')[:300])"})
             assert evidence.strip(), evidence
-            large = python_tool.call({"code": "print('x' * 20000)"})
-            assert len(large) <= int(os.getenv("PYTHON_TOOL_RETURN_MAX_CHARS", "6000")), len(large)
+            output_limit = int(os.getenv("PYTHON_TOOL_RETURN_MAX_CHARS", "50000"))
+            large = python_tool.call({"code": f"print('x' * {output_limit + 1000})"})
+            assert len(large) <= output_limit, len(large)
             assert "output truncated" in large, large[:100]
             print("page saved/Python tool read/cache/output limit: passed", flush=True)
         if args.judge:

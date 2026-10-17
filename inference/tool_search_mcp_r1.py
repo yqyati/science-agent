@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 
 from runtime_env import get_env_float, get_env_int
 from tool_http_client import tool_http_config, tool_http_request
+from sandbox_gateway import SandboxStateError
 from tool_provider_strategy import provider_strategy, strategy_search
 from tool_url_guard import (
     GUARD_FORMAT_SERPER_SEARCH_V1,
@@ -316,6 +317,9 @@ class Search(BaseTool):
                     error=str(e),
                 )
                 print(e)
+                if isinstance(e, SandboxStateError):
+                    failed_calls_search += 1
+                    return f"Google search unavailable: {e}"
                 if i == max_attempts - 1:
                     failed_calls_search += 1
                     if not SERPER_KEY and "google.serper.dev" in SERPER_API_URL:
@@ -357,8 +361,8 @@ class Search(BaseTool):
 
             if "organic" in results:
                 organic_info = ""
-                max_results = max(1, int(os.environ.get("SCIENCE_AGENT_SEARCH_MAX_RESULTS", "6")))
-                snippet_chars = max(100, int(os.environ.get("SCIENCE_AGENT_SEARCH_SNIPPET_CHARS", "600")))
+                max_results = max(1, int(os.environ.get("SCIENCE_AGENT_SEARCH_MAX_RESULTS", "10")))
+                snippet_chars = max(0, int(os.environ.get("SCIENCE_AGENT_SEARCH_SNIPPET_CHARS", "0")))
                 for i, item in enumerate(results["organic"][:max_results], 1):
                     title = item.get("title", "N/A")
                     link = item.get("link", "#")
@@ -366,7 +370,7 @@ class Search(BaseTool):
                         blocked_result_count += 1
                         continue
                     snippet = item.get("snippet", "N/A").replace("\n", " " ).strip()
-                    if len(snippet) > snippet_chars:
+                    if snippet_chars > 0 and len(snippet) > snippet_chars:
                         snippet = snippet[:snippet_chars].rsplit(" ", 1)[0] + "..."
                     organic_info += f"{i}. **[{title}]({link})**\n   - {snippet}\n"
                 # for page in results["organic"]:

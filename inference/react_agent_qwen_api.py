@@ -2828,24 +2828,6 @@ class MultiTurnReactAgent(FnCallAgent):
     def _estimate_trajectory_tokens(self, messages):
         return self.count_tokens(messages)
 
-    def _append_budget_notice(self, content, messages):
-        used_tokens = self._estimate_trajectory_tokens(
-            messages + [{"role": "tool", "content": content}]
-        )
-        remaining = max(0, TRAJECTORY_MAX_TOKENS - used_tokens)
-        notice = (
-            "\n\n[Budget] Approximately "
-            f"{remaining} tokens remain in the current context budget. "
-            "Further reasoning, tool calls, and tool results all consume this budget. "
-            "This estimate does not reserve tokens for the final answer. "
-            "When the remaining budget is insufficient, stop calling tools and provide the final answer."
-        )
-        if isinstance(content, str):
-            return content + notice
-        if isinstance(content, list):
-            return [*content, {"type": "text", "text": notice}]
-        return f"{tool_content_to_text(content)}{notice}"
-
     def get_tool_related_msg_indices(self, messages):
         tool_related_indices = []
         for idx in range(2, len(messages)):
@@ -3476,7 +3458,7 @@ class MultiTurnReactAgent(FnCallAgent):
                         "role": "tool",
                         "tool_call_id": tool.id,
                         "name": schema_name,
-                        "content": self._append_budget_notice(tool_response, passin_messages),
+                        "content": tool_response,
                     }
                     tool_response_text = tool_content_to_text(tool_response)
                     turn_tool_names.append(schema_name)
