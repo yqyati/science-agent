@@ -290,7 +290,7 @@ class SmokeJudgeTests(unittest.TestCase):
                 "SCIENCE_AGENT_JUDGE_BASE_URL": "http://judge/v1",
                 "SCIENCE_AGENT_JUDGE_MODEL": "o3-mini", "API_KEY": "test-key",
             }),
-            patch.object(sys, "argv", ["sandbox_smoke.py", "--judge"]),
+            patch.object(sys, "argv", ["sandbox_smoke.py", "--judge", "--attempts", "1"]),
             patch.object(self.smoke, "shared_sandbox_run", return_value=self.run),
             patch.object(self.smoke, "close_shared_sandbox_run"),
             patch.object(self.smoke, "tool_http_request", return_value=Mock(
@@ -325,6 +325,35 @@ class SmokeJudgeTests(unittest.TestCase):
         self.assertEqual(self.run.run_http.call_count, 9)
         self.assertEqual(self.smoke.time.sleep.call_count, 8)
         self.smoke.close_shared_sandbox_run.assert_called_once()
+
+    def test_whole_preflight_retries_with_fresh_instance_after_startup_failure(self):
+        first = Mock()
+        first.ensure.side_effect = gateway.SandboxGatewayError("command HTTP 403")
+        with patch.object(sys, "argv", ["sandbox_smoke.py", "--judge"]), \
+                patch.object(self.smoke, "shared_sandbox_run", side_effect=[first, self.run, self.run]):
+            self.smoke.main()
+        first.run_python.assert_not_called()
+        self.run.run_http.assert_called_once()
+        self.assertEqual(self.smoke.close_shared_sandbox_run.call_count, 2)
+        self.smoke.time.sleep.assert_called_once_with(5)
+
+    def test_whole_preflight_stops_after_three_failed_attempts(self):
+        self.run.ensure.side_effect = gateway.SandboxGatewayError("command HTTP 403")
+        with patch.object(sys, "argv", ["sandbox_smoke.py", "--judge"]):
+            with self.assertRaisesRegex(gateway.SandboxGatewayError, "command HTTP 403"):
+                self.smoke.main()
+        self.assertEqual(self.run.ensure.call_count, 3)
+        self.assertEqual(self.smoke.close_shared_sandbox_run.call_count, 3)
+        self.assertEqual([call.args[0] for call in self.smoke.time.sleep.call_args_list], [5, 15])
+
+    def test_cleanup_failure_does_not_start_another_instance(self):
+        self.run.ensure.side_effect = gateway.SandboxGatewayError("command HTTP 403")
+        self.smoke.close_shared_sandbox_run.side_effect = RuntimeError("deletion unconfirmed")
+        with patch.object(sys, "argv", ["sandbox_smoke.py", "--judge"]):
+            with self.assertRaisesRegex(SystemExit, "cleanup failed"):
+                self.smoke.main()
+        self.run.ensure.assert_called_once()
+        self.smoke.time.sleep.assert_not_called()
 
 
 if __name__ == "__main__":

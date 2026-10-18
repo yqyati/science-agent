@@ -139,17 +139,36 @@ class SandboxGatewayClient:
         return self._request("GET", f"/v1/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}")
 
     def wait_running(self, sandbox_id: str, timeout: int = 360) -> None:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        deadline = time.monotonic() + timeout
+        last_status = "not Running"
+        while time.monotonic() < deadline:
             data = self.detail(sandbox_id)
             status = data.get("status") if isinstance(data, dict) else {}
             state = (status or {}).get("state") or data.get("state")
             if state == "Running":
-                return
+                # Running can precede proxy authorization and command readiness.
+                # Probe with GET before sending bootstrap commands or Agent code.
+                try:
+                    code, _ = self.proxy_http(sandbox_id, 44772, "/ping", timeout=10)
+                except SandboxInactiveError:
+                    raise
+                except (SandboxGatewayError, urllib.error.URLError, TimeoutError) as exc:
+                    last_status = "command ping " + type(exc).__name__
+                else:
+                    if code == 200:
+                        return
+                    if code not in {403, 429, 500, 502, 503, 504}:
+                        raise SandboxGatewayError(f"command service ping HTTP {code}")
+                    last_status = f"command ping HTTP {code}"
+                logging.getLogger(__name__).warning(
+                    "Sandbox waiting for command service id=%s status=%s", sandbox_id, last_status,
+                )
+            else:
+                last_status = str(state)
             if state in {"Failed", "Error", "Terminated"}:
                 raise SandboxGatewayError(f"sandbox entered terminal state {state}: {data}")
             time.sleep(5)
-        raise SandboxGatewayError(f"sandbox did not become Running within {timeout}s")
+        raise SandboxGatewayError(f"sandbox did not become Running with ready command service within {timeout}s: {last_status}")
 
     def endpoint(self, sandbox_id: str, port: int = 44772) -> tuple[str, dict[str, str]]:
         data = self._request(
@@ -170,21 +189,32 @@ class SandboxGatewayClient:
         return url, request_headers
 
     def command(self, sandbox_id: str, command: str, timeout: int = 180) -> str:
-        url, headers = self.endpoint(sandbox_id)
-        headers = dict(headers)
-        headers["Content-Type"] = "application/json"
-        request = urllib.request.Request(
-            url + "/command",
-            data=json.dumps({"command": command, "user": "root"}).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:1000]
-            raise SandboxGatewayError(f"command HTTP {exc.code}: {detail}") from exc
+        retry_delays = (1, 5, 10)
+        for attempt in range(len(retry_delays) + 1):
+            url, headers = self.endpoint(sandbox_id)
+            headers = dict(headers)
+            headers["Content-Type"] = "application/json"
+            request = urllib.request.Request(
+                url + "/command",
+                data=json.dumps({"command": command, "user": "root"}).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    return response.read().decode("utf-8", errors="replace")
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")[:1000]
+                # This explicit connection failure precedes command dispatch.
+                # Other errors/timeouts can hide execution; never replay them.
+                if exc.code == 502 and "Sandbox upstream connection failed" in detail and attempt < len(retry_delays):
+                    logging.getLogger(__name__).warning(
+                        "Sandbox command connection retry id=%s attempt=%d/4 delay=%ss",
+                        sandbox_id, attempt + 1, retry_delays[attempt],
+                    )
+                    time.sleep(retry_delays[attempt])
+                    continue
+                raise SandboxGatewayError(f"command HTTP {exc.code} (attempt {attempt + 1}/4): {detail}") from exc
 
     @staticmethod
     def command_output(raw: str) -> str:
@@ -438,7 +468,7 @@ class AgentSandboxRun:
                     {"action": "allow", "target": "::/0"},
                 ]
         options = dict(
-            image=os.getenv("SCIENCE_AGENT_SANDBOX_IMAGE", "registry2-cloud.d.pjlab.org.cn/ccr-sandbox/claude-code:v1.1.1"),
+            image=os.getenv("SCIENCE_AGENT_SANDBOX_IMAGE", "registry.h.pjlab.org.cn/ailab-ai4sgi-ailab_ai4sgi_pool/yqy:science-agent-cpu-20261010"),
             cpu=os.getenv("SCIENCE_AGENT_SANDBOX_CPU", "2"),
             memory=os.getenv("SCIENCE_AGENT_SANDBOX_MEMORY", "4Gi"),
             timeout=int(os.getenv("SCIENCE_AGENT_SANDBOX_TIMEOUT", "1800")),

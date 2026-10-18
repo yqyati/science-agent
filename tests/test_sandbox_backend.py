@@ -91,6 +91,96 @@ class SandboxCreateRetryTests(unittest.TestCase):
         sleep.assert_not_called()
 
 
+class SandboxCommandReadinessTests(unittest.TestCase):
+    def test_running_waits_for_ping_without_dispatching_commands(self):
+        client = RealGatewayClient("http://gateway", "token")
+        with patch.object(client, "detail", return_value={"status": {"state": "Running"}}), \
+                patch.object(client, "proxy_http", side_effect=[(403, "forbidden"), (502, "upstream unavailable"), (200, "")]) as ping, \
+                patch.object(client, "command") as command, patch.object(gateway.time, "sleep") as sleep:
+            client.wait_running("sid")
+        self.assertEqual(ping.call_count, 3)
+        self.assertEqual(ping.call_args.args, ("sid", 44772, "/ping"))
+        self.assertEqual(sleep.call_count, 2)
+        command.assert_not_called()
+
+    def test_ping_timeout_can_recover_without_replaying_code(self):
+        client = RealGatewayClient("http://gateway", "token")
+        with patch.object(client, "detail", return_value={"state": "Running"}), \
+                patch.object(client, "proxy_http", side_effect=[TimeoutError("timeout"), (200, "")]) as ping, \
+                patch.object(gateway.time, "sleep"):
+            client.wait_running("sid")
+        self.assertEqual(ping.call_count, 2)
+
+    def test_ping_never_ready_stops_at_startup_deadline(self):
+        client = RealGatewayClient("http://gateway", "token")
+        with patch.object(client, "detail", return_value={"state": "Running"}), \
+                patch.object(client, "proxy_http", return_value=(403, "forbidden")) as ping, \
+                patch.object(gateway.time, "sleep"), \
+                patch.object(gateway.time, "monotonic", side_effect=[0, 0, 2]):
+            with self.assertRaisesRegex(gateway.SandboxGatewayError, "within 1s: command ping HTTP 403"):
+                client.wait_running("sid", timeout=1)
+        self.assertEqual(ping.call_count, 1)
+
+    def test_permanent_ping_error_and_terminal_state_fail_without_retry(self):
+        client = RealGatewayClient("http://gateway", "token")
+        with patch.object(client, "detail", return_value={"state": "Running"}), \
+                patch.object(client, "proxy_http", return_value=(401, "invalid credential")) as ping, \
+                patch.object(gateway.time, "sleep") as sleep:
+            with self.assertRaisesRegex(gateway.SandboxGatewayError, "ping HTTP 401"):
+                client.wait_running("sid")
+        ping.assert_called_once()
+        sleep.assert_not_called()
+        with patch.object(client, "detail", return_value={"state": "Failed"}), patch.object(client, "proxy_http") as ping:
+            with self.assertRaisesRegex(gateway.SandboxGatewayError, "terminal state Failed"):
+                client.wait_running("sid")
+        ping.assert_not_called()
+
+
+class SandboxCommandRetryTests(unittest.TestCase):
+    def test_connection_failure_retries_same_command_with_refreshed_endpoint(self):
+        client = RealGatewayClient("http://gateway", "secret-token")
+        errors = [HTTPError("http://worker", 502, "Bad Gateway", {},
+                            io.BytesIO(b"Sandbox upstream connection failed")) for _ in range(3)]
+        with patch.object(client, "endpoint", return_value=("http://worker", {})) as endpoint, \
+                patch.object(gateway.urllib.request, "urlopen", side_effect=errors + [io.BytesIO(b"uploaded")]) as request, \
+                patch.object(gateway.time, "sleep") as sleep, \
+                self.assertLogs(gateway.__name__, level="WARNING") as logs:
+            self.assertEqual(client.command("sid", "upload secret-content"), "uploaded")
+        self.assertEqual(endpoint.call_count, 4)
+        self.assertEqual(len({call.args[0].data for call in request.call_args_list}), 1)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 5, 10])
+        self.assertNotIn("secret-content", str(logs.output))
+        self.assertNotIn("secret-token", str(logs.output))
+
+    def test_connection_failure_stops_after_four_attempts(self):
+        client = RealGatewayClient("http://gateway", "token")
+        errors = [HTTPError("http://worker", 502, "Bad Gateway", {},
+                            io.BytesIO(b"Sandbox upstream connection failed")) for _ in range(4)]
+        with patch.object(client, "endpoint", return_value=("http://worker", {})), \
+                patch.object(gateway.urllib.request, "urlopen", side_effect=errors) as request, \
+                patch.object(gateway.time, "sleep") as sleep:
+            with self.assertRaisesRegex(gateway.SandboxGatewayError, "attempt 4/4"):
+                client.command("sid", "work")
+        self.assertEqual(request.call_count, 4)
+        self.assertEqual(sleep.call_count, 3)
+
+    def test_ambiguous_failures_never_replay_command(self):
+        client = RealGatewayClient("http://gateway", "token")
+        errors = [TimeoutError("response timed out"), URLError("connection lost"),
+                  HTTPError("http://worker", 403, "Forbidden", {}, io.BytesIO(b"<html>nginx 403</html>")),
+                  HTTPError("http://worker", 502, "Bad Gateway", {}, io.BytesIO(b"response interrupted")),
+                  HTTPError("http://worker", 503, "Unavailable", {}, io.BytesIO(b"temporary"))]
+        for error in errors:
+            with self.subTest(error=type(error).__name__), \
+                    patch.object(client, "endpoint", return_value=("http://worker", {})), \
+                    patch.object(gateway.urllib.request, "urlopen", side_effect=error) as request, \
+                    patch.object(gateway.time, "sleep") as sleep:
+                with self.assertRaises((gateway.SandboxGatewayError, TimeoutError, URLError)):
+                    client.command("sid", "work")
+                self.assertEqual(request.call_count, 1)
+                sleep.assert_not_called()
+
+
 class FakeClient:
     def __init__(self, *_args):
         self.deleted = []

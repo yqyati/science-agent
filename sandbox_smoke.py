@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--search", action="store_true", help="Test Serper web and scholar search through Sandbox")
     parser.add_argument("--diagnose-network", action="store_true", help="Inspect Sandbox DNS/proxy/IP connectivity without calling external tools")
     parser.add_argument("--http-url", default="https://r.jina.ai/https://example.com", help="HTTPS URL to test; defaults to the Jina page-reading route")
+    parser.add_argument("--attempts", type=int, choices=(1, 2, 3), default=3, help="Total preflight attempts, each using a fresh Sandbox (default: 3)")
     args = parser.parse_args()
     if args.search and not (os.getenv("SERPER_API_KEY") or os.getenv("SERPER_KEY_ID")):
         parser.error("Fill SERPER_API_KEY in sandbox.local.env for web and scholar search")
@@ -41,6 +42,22 @@ def main():
             missing.append("SCIENCE_AGENT_JUDGE_API_KEY or API_KEY")
         if missing:
             parser.error("Fill sandbox.local.env: " + ", ".join(missing))
+    retry_delays = (5, 15)
+    for attempt in range(args.attempts):
+        print(f"sandbox preflight attempt {attempt + 1}/{args.attempts}", flush=True)
+        try:
+            run_checks(args)
+            print("sandbox preflight: passed", flush=True)
+            return
+        except Exception as exc:
+            print(f"sandbox preflight attempt {attempt + 1}/{args.attempts} failed: {type(exc).__name__}: {exc}", flush=True)
+            if attempt + 1 == args.attempts:
+                raise
+            print(f"sandbox preflight retry with fresh instance in {retry_delays[attempt]}s", flush=True)
+            time.sleep(retry_delays[attempt])
+
+
+def run_checks(args):
     try:
         run = shared_sandbox_run()
         print("sandbox_id:", run.ensure(), flush=True)
@@ -191,7 +208,11 @@ def main():
         assert shared_sandbox_run() is run
         print("shared run: passed", flush=True)
     finally:
-        close_shared_sandbox_run()
+        try:
+            close_shared_sandbox_run()
+        except Exception as exc:
+            # Do not start another instance while cleanup remains unconfirmed.
+            raise SystemExit("Sandbox preflight cleanup failed; refusing to create another instance") from exc
         print("cleanup: done", flush=True)
 
 

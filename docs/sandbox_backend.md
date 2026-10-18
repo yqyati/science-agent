@@ -40,6 +40,13 @@ bash run_sandbox_harness.sh python3 sandbox_smoke.py --llm
 bash run_sandbox_harness.sh python3 sandbox_smoke.py --llm --tools
 ```
 
+`sandbox_smoke.py` retries the whole preflight up to three times by default,
+waiting 5 then 15 seconds after failed checks. Each attempt cleans up its
+Sandbox before creating a fresh instance and repeats all requested checks.
+Use `--attempts 1` to disable whole-preflight retries. Missing configuration
+fails before any attempt; unconfirmed cleanup stops without another instance.
+Evaluation and training launchers inherit this behavior through the smoke script.
+
 Login once before starting the workload. Child Agents inherit the gateway Token;
 creating an instance does not require another login. The platform documentation
 specifies a 15-day Token lifetime; reauthenticate after expiry.
@@ -59,11 +66,24 @@ Repeat the save command before expiry. The AD password is never saved.
 
 ## Runtime
 
+Evaluation and training tool Sandboxes default to
+`registry.h.pjlab.org.cn/ailab-ai4sgi-ailab_ai4sgi_pool/yqy:science-agent-cpu-20261010`.
+The gateway, launcher, and example configuration use this image; an explicit
+`SCIENCE_AGENT_SANDBOX_IMAGE` overrides it. Live platform validation passed
+scientific computation, persistent Python, page storage/cache, web and Scholar
+search, image upload/crop/plot, and cleanup. This setting selects the tool
+Sandbox image; the GPU job has its own runtime image.
+
 Instances are created lazily with ports 44772 (command), 18080 (Python), and
 18081 (HTTP). Worker files are uploaded automatically to `/tmp` through the
 command endpoint. No custom image build is needed. Both workers must pass
 `/health` before use; initialization errors are reported without silently
 switching to single-shot Python or host HTTP.
+
+After the management API reports Running, startup also waits for the command
+service's GET `/ping` to return HTTP 200 before bootstrap uploads or commands.
+Transient readiness failures, including proxy HTTP 403, wait within the startup
+timeout. A command POST receiving HTTP 403 still fails without replay.
 
 The shared creation endpoint retries HTTP 403, 429, 500, 502, 503, 504 and
 URL/timeout errors up to four total attempts, waiting 1, 5, then 10 seconds.
