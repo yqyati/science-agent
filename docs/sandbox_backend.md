@@ -64,6 +64,22 @@ The wrapper exports the saved `OPEN_SANDBOX_GATEWAY_TOKEN`; no interactive
 login is needed in the job. The same shared path must be mounted in the job.
 Repeat the save command before expiry. The AD password is never saved.
 
+Gateway clients check the JWT expiry before management requests. Within 30 seconds
+of expiry they reread `OPEN_SANDBOX_GATEWAY_TOKEN` from `SANDBOX_LOCAL_ENV_FILE`
+(default: this harness's `sandbox.local.env`) and switch to a valid replacement.
+The wrapper exports the absolute config path, so working-directory changes do not
+redirect reloads. Existing clients and new clients inheriting an old environment
+can both pick up the saved credential; no shell code in the file is executed.
+This does not log in or extend the old Token's lifetime. If the old Token expires
+without a valid replacement in the file, requests fail with an explicit update
+instruction rather than waiting indefinitely.
+
+A management GET rejected with HTTP 401 also checks for a replacement and retries
+once if it changed. Other 403 responses retain their existing handling; they are
+not assumed to mean expiry. Commands and tool POSTs are not replayed on auth
+errors. Reloading preserves an existing Sandbox ID, workspace and Python state.
+Workers must load this code to use it; already-running workers are not hot patched.
+
 ## Runtime
 
 Evaluation and training tool Sandboxes default to

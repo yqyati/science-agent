@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import base64
 import io
 import json
 import os
@@ -21,6 +22,146 @@ import sandbox_http_worker as http_worker
 import sandbox_python_worker as python_worker
 import tool_http_client as transport
 RealGatewayClient = gateway.SandboxGatewayClient
+
+
+class SandboxTokenReloadTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.config = Path(directory.name) / "sandbox.local.env"
+        environment = patch.dict(os.environ, {"SANDBOX_LOCAL_ENV_FILE": str(self.config)})
+        environment.start()
+        self.addCleanup(environment.stop)
+        clock = patch.object(gateway.time, "time", return_value=1000)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    @staticmethod
+    def token(expiry):
+        payload = base64.urlsafe_b64encode(json.dumps({"exp": expiry}).encode()).decode().rstrip("=")
+        return f"header.{payload}.signature"
+
+    def save(self, token):
+        self.config.write_text("export OPEN_SANDBOX_GATEWAY_TOKEN=" + shlex.quote(token) + "\n")
+
+    def test_expired_client_loads_new_token_for_both_endpoint_headers(self):
+        old, new = self.token(999), self.token(2000)
+        client = RealGatewayClient("http://gateway", old)
+        self.save(new)
+        with patch.object(gateway.urllib.request, "urlopen", return_value=io.BytesIO(b'{"endpoint":"http://worker"}')) as request:
+            with self.assertLogs(gateway.__name__, level="INFO") as logs:
+                _, headers = client.endpoint("sid")
+        self.assertEqual(request.call_count, 1)
+        sent_headers = dict((k.lower(), v) for k, v in request.call_args.args[0].header_items())
+        self.assertEqual(sent_headers["authorization"], "Bearer " + new)
+        self.assertEqual(sent_headers["open-sandbox-api-key"], new)
+        self.assertEqual(headers["OPEN-SANDBOX-API-KEY"], new)
+        self.assertNotIn(new, str(logs.output))
+        self.assertNotIn(old, str(logs.output))
+
+    def test_expired_token_is_replaced_before_creation_without_duplicate_posts(self):
+        client = RealGatewayClient("http://gateway", self.token(999))
+        self.save(self.token(2000))
+        with patch.object(gateway.urllib.request, "urlopen", return_value=io.BytesIO(b'{"id":"sid"}')) as request:
+            self.assertEqual(client.create(image="image"), "sid")
+        self.assertEqual(request.call_count, 1)
+
+    def test_existing_sandbox_uses_new_token_without_recreation(self):
+        client = RealGatewayClient("http://gateway", self.token(999))
+        new = self.token(2000)
+        self.save(new)
+        replies = [io.BytesIO(b'{"endpoint":"http://worker"}'), io.BytesIO(b"done")]
+        with patch.object(gateway.urllib.request, "urlopen", side_effect=replies) as request, \
+                patch.object(client, "create") as create:
+            self.assertEqual(client.command("existing-sid", "work"), "done")
+        create.assert_not_called()
+        lookup, command = [call.args[0] for call in request.call_args_list]
+        self.assertIn("/existing-sid/endpoints/", lookup.full_url)
+        self.assertEqual(command.get_method(), "POST")
+        self.assertEqual(command.get_header("Open-sandbox-api-key"), new)
+
+    def test_atomic_file_replacement_is_visible_to_existing_client(self):
+        client = RealGatewayClient("http://gateway", self.token(999))
+        self.save(self.token(999))
+        replacement = self.config.with_suffix(".new")
+        replacement.write_text("OPEN_SANDBOX_GATEWAY_TOKEN=" + self.token(2000) + "\n")
+        replacement.replace(self.config)
+        self.assertTrue(client._refresh_token())
+        self.assertEqual(client.token, self.token(2000))
+
+    def test_old_process_environment_can_create_multiple_refreshed_clients(self):
+        old, new = self.token(999), self.token(2000)
+        self.save(new)
+        with patch.dict(os.environ, {"OPEN_SANDBOX_GATEWAY_TOKEN": old}):
+            for _ in range(2):
+                client = RealGatewayClient("http://gateway", gateway.AgentSandboxRun._token())
+                self.assertTrue(client._refresh_token())
+                self.assertEqual(client.token, new)
+            self.assertEqual(os.environ["OPEN_SANDBOX_GATEWAY_TOKEN"], old)
+
+    def test_read_only_auth_rejection_reloads_once(self):
+        client = RealGatewayClient("http://gateway", "old-opaque-token")
+        self.save("new-opaque-token")
+        error = HTTPError("http://gateway", 401, "unauthorized", {}, io.BytesIO(b"unauthorized"))
+        with patch.object(gateway.urllib.request, "urlopen", side_effect=[error, io.BytesIO(b'{"state":"Running"}')]) as request:
+            self.assertEqual(client.detail("sid"), {"state": "Running"})
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_args.args[0].get_header("Authorization"), "Bearer new-opaque-token")
+
+    def test_rejected_replacement_does_not_loop(self):
+        client = RealGatewayClient("http://gateway", "old-opaque-token")
+        self.save("new-opaque-token")
+        errors = [HTTPError("http://gateway", 401, "unauthorized", {}, io.BytesIO(b"unauthorized")) for _ in range(2)]
+        with patch.object(gateway.urllib.request, "urlopen", side_effect=errors) as request:
+            with self.assertRaises(gateway.SandboxGatewayError):
+                client.detail("sid")
+        self.assertEqual(request.call_count, 2)
+
+    def test_valid_token_is_retained_until_near_expiry(self):
+        client = RealGatewayClient("http://gateway", self.token(2000))
+        self.save(self.token(3000))
+        self.assertFalse(client._refresh_token())
+        self.assertEqual(client.token, self.token(2000))
+        client.token = self.token(1020)
+        self.assertTrue(client._refresh_token())
+        self.assertEqual(client.token, self.token(3000))
+
+    def test_missing_unchanged_expired_or_empty_replacement_fails_before_network(self):
+        old = self.token(999)
+        for replacement in (None, "", old, self.token(900), "malformed-token"):
+            with self.subTest(replacement=replacement):
+                if replacement is None:
+                    self.config.unlink(missing_ok=True)
+                else:
+                    self.save(replacement)
+                client = RealGatewayClient("http://gateway", old)
+                with patch.object(gateway.urllib.request, "urlopen") as request:
+                    with self.assertRaisesRegex(gateway.SandboxGatewayError, "No valid replacement"):
+                        client.detail("sid")
+                request.assert_not_called()
+
+    def test_environment_file_is_not_executed(self):
+        marker = self.config.parent / "must-not-exist"
+        self.config.write_text(f'touch {marker}\nOPEN_SANDBOX_GATEWAY_TOKEN="$(touch {marker})"\n')
+        client = RealGatewayClient("http://gateway", self.token(999))
+        with self.assertRaises(gateway.SandboxGatewayError):
+            client._refresh_token()
+        self.assertFalse(marker.exists())
+
+    def test_command_and_tool_auth_errors_are_not_replayed(self):
+        self.save("new-opaque-token")
+        for operation in ("command", "proxy_json"):
+            with self.subTest(operation=operation):
+                client = RealGatewayClient("http://gateway", "old-opaque-token")
+                error = HTTPError("http://worker", 401, "unauthorized", {}, io.BytesIO(b"unauthorized"))
+                with patch.object(client, "endpoint", return_value=("http://worker", {})), \
+                        patch.object(gateway.urllib.request, "urlopen", side_effect=error) as request:
+                    with self.assertRaises(gateway.SandboxGatewayError):
+                        if operation == "command":
+                            client.command("sid", "work")
+                        else:
+                            client.proxy_json("sid", 18080, "/execute", {"code": "work"})
+                self.assertEqual(request.call_count, 1)
 
 
 class SandboxCreateRetryTests(unittest.TestCase):

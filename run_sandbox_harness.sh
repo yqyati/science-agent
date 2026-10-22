@@ -18,6 +18,7 @@ set -a
 # This file is local-only and ignored by Git.
 source "${config_file}"
 set +a
+export SANDBOX_LOCAL_ENV_FILE="$(cd -- "$(dirname -- "$config_file")" && pwd)/$(basename -- "$config_file")"
 
 export SCIENCE_AGENT_SANDBOX_BASE_URL="${SCIENCE_AGENT_SANDBOX_BASE_URL:-${BASE_URL:-http://10.12.111.133:10018}}"
 export SCIENCE_AGENT_READ_PAGE_MODE="${SCIENCE_AGENT_READ_PAGE_MODE:-file}"

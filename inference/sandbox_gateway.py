@@ -13,6 +13,7 @@ import inspect
 import json
 import logging
 import os
+import shlex
 import ssl
 import hashlib
 import posixpath
@@ -24,6 +25,7 @@ import urllib.parse
 import urllib.request
 from contextvars import ContextVar
 from functools import wraps
+from pathlib import Path
 from typing import Any
 from sandbox_recovery import RecoveryJournal, result_digest
 
@@ -45,11 +47,55 @@ class SandboxGatewayClient:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.resource = resource or None
+        self._token_lock = threading.Lock()
+        self._token_file = Path(os.getenv(
+            "SANDBOX_LOCAL_ENV_FILE", str(Path(__file__).resolve().parents[1] / "sandbox.local.env"),
+        )).expanduser().resolve()
+
+    @staticmethod
+    def _token_expiry(token: str) -> float | None:
+        # Unverified JWT claims only schedule credential reloads; the gateway verifies auth.
+        try:
+            part = token.split(".")[1]
+            value = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))).get("exp")
+            return float(value) if isinstance(value, (int, float)) else None
+        except (IndexError, ValueError, TypeError, AttributeError):
+            return None
+
+    def _refresh_token(self, *, force: bool = False) -> bool:
+        with self._token_lock:
+            expiry = self._token_expiry(self.token)
+            now = time.time()
+            if not force and (expiry is None or expiry > now + 30):
+                return False
+            candidate = None
+            try:
+                for line in self._token_file.read_text().splitlines():
+                    line = line.strip().removeprefix("export ").strip()
+                    key, sep, value = line.partition("=")
+                    if sep and key.strip() == "OPEN_SANDBOX_GATEWAY_TOKEN":
+                        parts = shlex.split(value, comments=True)
+                        candidate = parts[0] if len(parts) == 1 else None
+            except (OSError, ValueError, UnicodeError):
+                # Never source shell code or log credentials from the environment file.
+                logging.getLogger(__name__).warning("Cannot read Sandbox credential file: %s", self._token_file)
+            candidate_expiry = self._token_expiry(candidate) if candidate else None
+            usable = candidate_expiry > now if candidate_expiry is not None else expiry is None
+            if candidate and candidate != self.token and usable:
+                self.token = candidate
+                logging.getLogger(__name__).info("Reloaded Sandbox credential from %s", self._token_file)
+                return True
+            if expiry is not None and expiry <= now:
+                raise SandboxGatewayError(
+                    f"Sandbox token expired; update OPEN_SANDBOX_GATEWAY_TOKEN in {self._token_file}. "
+                    "No valid replacement credential was found."
+                )
+            return False
 
     def _request(self, method: str, path: str, body: Any = None, *, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> Any:
         query = urllib.parse.urlencode(params or {}, doseq=True)
         url = self.base_url + path + (("?" + query) if query else "")
-        request_headers = {"Authorization": f"Bearer {self.token}"}
+        request_headers = {}
         if self.resource:
             request_headers["X-Sandbox-Resource"] = self.resource
         data = None
@@ -57,8 +103,12 @@ class SandboxGatewayClient:
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
             request_headers["Content-Type"] = "application/json"
         request_headers.update(headers or {})
-        request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
         for attempt in range(3):
+            self._refresh_token()
+            request_headers["Authorization"] = f"Bearer {self.token}"
+            if "OPEN-SANDBOX-API-KEY" in request_headers:
+                request_headers["OPEN-SANDBOX-API-KEY"] = self.token
+            request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
             try:
                 with urllib.request.urlopen(request, timeout=180) as response:
                     raw = response.read()
@@ -68,6 +118,10 @@ class SandboxGatewayClient:
                 # An already-removed sandbox needs no further cleanup.
                 if method == "DELETE" and exc.code == 404 and "sandbox not found" in detail.lower():
                     return None
+                # Read-only lookups can safely repeat after an auth rejection. Tool/command
+                # POSTs are never replayed here, since their execution outcome may be unknown.
+                if exc.code == 401 and method == "GET" and attempt == 0 and self._refresh_token(force=True):
+                    continue
                 # GET cannot execute Agent code; retry transient authorization
                 # and gateway failures without replaying create/command requests.
                 if method == "GET" and exc.code in {403, 502, 503, 504} and attempt < 2:
