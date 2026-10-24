@@ -17,6 +17,30 @@ chain using the actual adapter function when the adjacent Molt checkout exists.
 Changing extraction does not update already loaded processes or saved grades;
 existing runs require extraction from saved full responses and rejudging.
 
+## Context compaction and finalization
+
+`AGENT_CONTEXT_COMPACTION` remains disabled by default. To enable proactive
+compaction between turns, set these variables before starting the worker:
+
+```bash
+export AGENT_CONTEXT_COMPACTION=1
+export AGENT_CONTEXT_COMPACT_THRESHOLD_TOKENS=57344  # 56 * 1024; default
+```
+
+After a turn and its tool calls, the agent first accepts a valid final answer.
+Otherwise, reaching the soft threshold triggers one compaction per task. After
+that, reaching the threshold again triggers the existing tool-free finalization
+request, even if `AGENT_EVAL_FORCE_FINALIZE=0`. Failed or ineffective compaction
+also leads to finalization. A successful context-error recovery compaction counts
+toward the same task limit. The counter resets for the next task and is returned
+as `context_compaction_count` (including proactive attempts that fail).
+
+This reuses the existing summarizer, client and endpoint. It does not isolate
+summary generation from Molt recording or change Flash RL's segment weighting.
+Molt's generation/context and training length limits remain unchanged. Checks
+happen between turns, so one long completion or tool response can still exceed
+the remaining context before this check runs; this is not a strict token reserve.
+
 ## Local configuration and login
 
 `sandbox.local.env` stores local API settings and is ignored by Git. If it does

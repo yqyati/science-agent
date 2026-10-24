@@ -94,10 +94,13 @@ AGENT_EVAL_FORCE_FINAL_RECOVERY_DRAFT_CHARS = max(
     get_env_int("AGENT_EVAL_FORCE_FINAL_RECOVERY_DRAFT_CHARS", default=32000),
 )
 
-# Opt-in context compaction for context-length errors. Disabled by default so
-# existing runtime logic is unaffected. When enabled, older conversation history
-# is summarized on context-length errors and the request is retried.
+# Opt-in context compaction. Also checked between turns: compact once per task,
+# then finalize if the soft threshold is reached again. Disabled by default.
 AGENT_CONTEXT_COMPACTION = get_env_bool("AGENT_CONTEXT_COMPACTION", default=False)
+AGENT_CONTEXT_COMPACT_THRESHOLD_TOKENS = max(
+    1,
+    get_env_int("AGENT_CONTEXT_COMPACT_THRESHOLD_TOKENS", default=56 * 1024),
+)
 AGENT_CONTEXT_COMPACT_RECENT_TURNS = max(
     1,
     get_env_int("AGENT_CONTEXT_COMPACT_RECENT_TURNS", default=8),
@@ -2495,7 +2498,11 @@ class MultiTurnReactAgent(FnCallAgent):
                 )
 
                 compactor = _get_context_compactor()
-                if compactor is not None and parse_context_length_error(response_error_text):
+                if (
+                    compactor is not None
+                    and not getattr(self, "_context_compaction_count", 0)
+                    and parse_context_length_error(response_error_text)
+                ):
                     summary_client = client or OpenAI(
                         api_key=openai_api_key,
                         base_url=openai_api_base,
@@ -2514,6 +2521,7 @@ class MultiTurnReactAgent(FnCallAgent):
                         msgs = compacted
                         local_input_tokens = self.count_tokens(msgs, request_tool_schemas)
                         context_compact_count += 1
+                        self._context_compaction_count = getattr(self, "_context_compaction_count", 0) + 1
                         max_tries += 1
                         attempt += 1
                         terminal_print(
@@ -2615,7 +2623,11 @@ class MultiTurnReactAgent(FnCallAgent):
                         raise RuntimeError(diagnostic) from exc
                 if getattr(exc, "status_code", None) == 400:
                     compactor = _get_context_compactor()
-                    if compactor is not None and parse_context_length_error(error_text):
+                    if (
+                        compactor is not None
+                        and not getattr(self, "_context_compaction_count", 0)
+                        and parse_context_length_error(error_text)
+                    ):
                         summary_client = client or OpenAI(
                             api_key=openai_api_key,
                             base_url=openai_api_base,
@@ -2634,6 +2646,7 @@ class MultiTurnReactAgent(FnCallAgent):
                             msgs = compacted
                             local_input_tokens = self.count_tokens(msgs, request_tool_schemas)
                             context_compact_count += 1
+                            self._context_compaction_count = getattr(self, "_context_compaction_count", 0) + 1
                             max_tries += 1
                             attempt += 1
                             terminal_print(
@@ -3243,6 +3256,46 @@ class MultiTurnReactAgent(FnCallAgent):
             "tool_calls": serialized_tool_calls,
         }, usage
 
+    def _compact_at_soft_limit(self, messages):
+        """Return (next context, finalization reason); retain the full diagnostic history elsewhere."""
+        if not AGENT_CONTEXT_COMPACTION:
+            return messages, ""
+        threshold = min(AGENT_CONTEXT_COMPACT_THRESHOLD_TOKENS, TRAJECTORY_MAX_TOKENS)
+        token_count = self.count_tokens(self._observation_masked_view(messages))
+        if token_count < threshold:
+            return messages, ""
+        if self._context_compaction_count:
+            return messages, "context soft limit reached after compaction"
+
+        # Count attempts as well as successes: a failed summary must not cause a loop.
+        self._context_compaction_count += 1
+        try:
+            client = OpenAI(
+                api_key=self._get_api_key(),
+                base_url=self._get_api_base(),
+                timeout=self.request_timeout,
+            )
+            compacted = _get_context_compactor()._compact_messages(
+                copy.deepcopy(messages),
+                client,
+                self.served_model_name_actual or self.served_model_name,
+                self._active_tool_schemas_for_current_task(),
+                self.request_timeout,
+                TRAJECTORY_MAX_TOKENS,
+            )
+        except Exception as exc:
+            terminal_print(f"Proactive context compaction failed: {type(exc).__name__}")
+            compacted = None
+        if compacted is None:
+            return messages, "context compaction failed at soft limit"
+        compacted_count = self.count_tokens(self._observation_masked_view(compacted))
+        if compacted_count >= token_count:
+            return messages, "context compaction did not reduce context"
+        terminal_print(f"Context compacted at soft limit: {token_count} -> {compacted_count} tokens")
+        if compacted_count >= threshold:
+            return compacted, "context remains above soft limit after compaction"
+        return compacted, ""
+
     @sandbox_run_scope
     def _run(self, data: str, served_model_name: Optional[str] = None, **kwargs) -> List[List[Message]]:
         del kwargs
@@ -3297,6 +3350,7 @@ class MultiTurnReactAgent(FnCallAgent):
         termination = None
         response_was_truncated = False
         trajectory_budget_exhausted = False
+        self._context_compaction_count = 0
         usage_totals: dict[str, int] = {}
         has_usage = False
 
@@ -3308,6 +3362,7 @@ class MultiTurnReactAgent(FnCallAgent):
             result["generation_truncated"] = response_was_truncated
             result["trajectory_budget_exhausted"] = trajectory_budget_exhausted
             result["final_answer_valid"] = bool(prediction)
+            result["context_compaction_count"] = self._context_compaction_count
             result["truncated"] = response_was_truncated or trajectory_budget_exhausted
             if trajectory_budget_exhausted and not prediction:
                 result["termination"] = "trajectory budget exhausted without valid final answer"
@@ -3480,7 +3535,12 @@ class MultiTurnReactAgent(FnCallAgent):
                 # so the reward adapter can skip the judge and assign 0.
                 prediction = ""
                 termination = "answer not found"
-                break
+                if (
+                    not AGENT_CONTEXT_COMPACTION
+                    or self.count_tokens(self._observation_masked_view(passin_messages))
+                    < min(AGENT_CONTEXT_COMPACT_THRESHOLD_TOKENS, TRAJECTORY_MAX_TOKENS)
+                ):
+                    break
 
                 if (
                     not AGENT_EVAL_FORCE_FINALIZE
@@ -3499,10 +3559,16 @@ class MultiTurnReactAgent(FnCallAgent):
             elif num_llm_calls_available <= 0:
                 finalization_reason = "llm call budget reached"
 
+            context_finalization_reason = ""
+            if not finalization_reason:
+                passin_messages, context_finalization_reason = self._compact_at_soft_limit(passin_messages)
+            if context_finalization_reason:
+                finalization_reason = context_finalization_reason
+
             if (
-                AGENT_EVAL_FORCE_FINALIZE
+                (AGENT_EVAL_FORCE_FINALIZE or bool(context_finalization_reason))
                 and finalization_reason
-                and "<answer>" not in content
+                and not self._extract_terminal_answer(content)
             ):
                 forced_message, forced_usage = self._attempt_forced_finalization(
                     passin_messages,
