@@ -28,6 +28,19 @@ export AGENT_CONTEXT_COMPACT_THRESHOLD_TOKENS=57344  # 56 * 1024; default
 ```
 
 After a turn and its tool calls, the agent first accepts a valid final answer.
+Compaction preserves the system message, original user query (including images),
+and the latest complete assistant/tool turns. `AGENT_CONTEXT_COMPACT_RECENT_TURNS`
+defaults to 2; the final tool response belongs to these turns and is not handled
+separately. The summarizer receives the complete current conversation, including
+the system message, original query, and recent turns. Older turns are replaced with a separate user message after the
+original query, marked as a context summary with instructions to continue the
+original task. Recent turns follow that summary.
+The complete history is serialized as JSON with angle brackets Unicode-escaped,
+so quoted model protocol markers remain data rather than active special tokens.
+Only the summary body is copied back: separate reasoning fields are excluded;
+for raw Molt text, inline thinking through `</think>` and trailing message-end
+markers are removed. An unfinished `<think>` block supplies no summary body.
+This extraction does not alter the recorded summary-generation action.
 Otherwise, reaching the soft threshold triggers one compaction per task. After
 that, reaching the threshold again triggers the existing tool-free finalization
 request, even if `AGENT_EVAL_FORCE_FINALIZE=0`. Failed or ineffective compaction
@@ -36,7 +49,9 @@ toward the same task limit. The counter resets for the next task and is returned
 as `context_compaction_count` (including proactive attempts that fail).
 
 This reuses the existing summarizer, client and endpoint. It does not isolate
-summary generation from Molt recording or change Flash RL's segment weighting.
+summary generation from Molt recording: the summary-generation action is intended
+to participate in training. The copied summary and recent history are context in
+the next segment, not newly generated actions. Flash RL's segment weighting is unchanged.
 Molt's generation/context and training length limits remain unchanged. Checks
 happen between turns, so one long completion or tool response can still exceed
 the remaining context before this check runs; this is not a strict token reserve.

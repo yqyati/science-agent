@@ -185,7 +185,7 @@ def run_checks(args):
                          "response_format": {"type": "json_object"},
                          "messages": [{"role": "user", "content": 'Grade candidate 2 against reference 2 for 1+1. Return JSON {"score": 1, "correct": true}.'}]},
             }
-            retry_delays = (1, 5, 10, 30, 60, 180, 180, 180)
+            retry_delays = (1, 5, 10, 30, 60, 180)
             for attempt in range(len(retry_delays) + 1):
                 try:
                     response = run.run_http(judge_request, timeout=float(os.getenv("SCIENCE_AGENT_JUDGE_TIMEOUT", "180")))
