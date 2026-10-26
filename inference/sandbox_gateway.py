@@ -495,7 +495,7 @@ class AgentSandboxRun:
         self.client = SandboxGatewayClient(
             os.getenv("SCIENCE_AGENT_SANDBOX_BASE_URL", "http://10.12.111.133:10018"),
             token,
-            os.getenv("SCIENCE_AGENT_SANDBOX_RESOURCE", "10.12.111.143/ailab-ma4agismall"),
+            os.getenv("SCIENCE_AGENT_SANDBOX_RESOURCE", "10.12.111.143/ailab-ai4sgi"),
         )
         sandbox_env = {
             name: os.environ[name]

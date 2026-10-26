@@ -94,12 +94,16 @@ AGENT_EVAL_FORCE_FINAL_RECOVERY_DRAFT_CHARS = max(
     get_env_int("AGENT_EVAL_FORCE_FINAL_RECOVERY_DRAFT_CHARS", default=32000),
 )
 
-# Opt-in context compaction. Also checked between turns: compact once per task,
-# then finalize if the soft threshold is reached again. Disabled by default.
+# Opt-in context compaction with a per-task allowance. Finalization remains
+# controlled independently by AGENT_EVAL_FORCE_FINALIZE.
 AGENT_CONTEXT_COMPACTION = get_env_bool("AGENT_CONTEXT_COMPACTION", default=False)
 AGENT_CONTEXT_COMPACT_THRESHOLD_TOKENS = max(
     1,
     get_env_int("AGENT_CONTEXT_COMPACT_THRESHOLD_TOKENS", default=56 * 1024),
+)
+AGENT_CONTEXT_COMPACT_MAX_COMPACTIONS = max(
+    1,
+    get_env_int("AGENT_CONTEXT_COMPACT_MAX_COMPACTIONS", default=1),
 )
 AGENT_CONTEXT_COMPACT_RECENT_TURNS = max(
     1,
@@ -2524,7 +2528,7 @@ class MultiTurnReactAgent(FnCallAgent):
                 compactor = _get_context_compactor()
                 if (
                     compactor is not None
-                    and not getattr(self, "_context_compaction_count", 0)
+                    and getattr(self, "_context_compaction_count", 0) < AGENT_CONTEXT_COMPACT_MAX_COMPACTIONS
                     and parse_context_length_error(response_error_text)
                 ):
                     summary_client = client or OpenAI(
@@ -2649,7 +2653,7 @@ class MultiTurnReactAgent(FnCallAgent):
                     compactor = _get_context_compactor()
                     if (
                         compactor is not None
-                        and not getattr(self, "_context_compaction_count", 0)
+                        and getattr(self, "_context_compaction_count", 0) < AGENT_CONTEXT_COMPACT_MAX_COMPACTIONS
                         and parse_context_length_error(error_text)
                     ):
                         summary_client = client or OpenAI(
@@ -3063,42 +3067,57 @@ class MultiTurnReactAgent(FnCallAgent):
                 return cleaned
         return ""
 
-    def _question_requires_boxed(self, question: str) -> bool:
-        lowered = str(question).lower()
-        return "\\boxed" in lowered or "boxed" in lowered
-
     def _build_forced_finalization_user_message(
         self,
         question: str,
         reason: str,
     ) -> dict:
-        if self._question_requires_boxed(question):
+        answer_type = os.getenv("AGENT_ANSWER_TYPE", "boxed").strip().lower()
+        if answer_type not in {"boxed", "plain"}:
+            raise ValueError("AGENT_ANSWER_TYPE must be 'boxed' or 'plain'")
+        if answer_type == "boxed":
             format_line = (
-                "Inside <answer>, keep the required \\boxed{...} format for the final answer."
+                "Inside <answer>, put Final Answer: on its own line, followed by "
+                "the final answer in \\boxed{...} format."
+            )
+            example_answer = "Final Answer:\n\\boxed{XXXX}"
+            example_guidance = (
+                "For multiple answers, use a separate box for each answer in the "
+                "requested order.\n"
             )
         else:
             format_line = (
                 "Inside <answer>, preserve any benchmark-specific final-answer format already requested."
             )
+            example_answer = "XXXX"
+            example_guidance = ""
         return {
             "role": "user",
             "content": (
                 "Tool-use budget is exhausted or nearly exhausted for this problem. "
                 "Do not call any more tools. Based only on the information already gathered, "
-                "provide your best final response now.\n\n"
+                "provide your best final response now. "
+                "Avoid redundant reasoning or revisiting steps already resolved, and "
+                "give your final answer as soon as possible.\n\n"
                 "Requirements:\n"
-                "1. Do not produce another reasoning trace or a <think> section; the prior "
-                "reasoning is already preserved.\n"
-                "2. Return only the final response inside <answer></answer>.\n"
-                f"3. {format_line}\n"
-                "4. Keep the final response under 800 words. State only the result and the "
-                "minimum equations or evidence needed to make it self-contained; do not "
+                "1. Put your complete final response inside <answer></answer>.\n"
+                f"2. {format_line}\n"
+                "3. State the result and the equations or evidence needed to make it "
+                "self-contained; do not "
                 "repeat the research history, tool outputs, or alternative derivations.\n"
-                "5. Do not apologize or mention tool limits.\n"
-                "6. If tools were used and their observations contain source URLs, "
+                "4. Do not apologize or mention tool limits.\n"
+                "5. If tools were used and their observations contain source URLs, "
                 "cite supported claims with [^n^] and append matching [^n^]: URL "
                 "definitions using only URLs that were actually observed.\n"
-                f"7. Trigger for this instruction: {reason}."
+                f"6. Trigger for this instruction: {reason}.\n\n"
+                f"{example_guidance}"
+                "Format-only example (replace XXXX with your actual complete answer; "
+                "do not output XXXX literally):\n"
+                "<answer>\n"
+                f"{example_answer}\n"
+                "</answer>\n"
+                "Give a concrete best answer. Do not output placeholders, a new "
+                "investigation plan, or <tool_call> blocks."
             ),
         }
 
@@ -3197,13 +3216,9 @@ class MultiTurnReactAgent(FnCallAgent):
                     },
                     {
                         "role": "user",
-                        "content": (
-                            "The analysis above is already complete. Do not restart or extend "
-                            "the derivation and do not call tools. Return only a self-contained "
-                            "final response inside <answer></answer>, using at most 600 words. "
-                            "Preserve any required benchmark answer format and only retain "
-                            "citations whose URLs already appear in the analysis."
-                        ),
+                        "content": self._build_forced_finalization_user_message(
+                            question, f"{reason}; finalize using the analysis above"
+                        )["content"],
                     },
                 ]
                 emit_trace(
@@ -3282,13 +3297,15 @@ class MultiTurnReactAgent(FnCallAgent):
 
     def _compact_at_soft_limit(self, messages):
         """Return (next context, finalization reason); retain the full diagnostic history elsewhere."""
-        if not AGENT_CONTEXT_COMPACTION:
+        if not (AGENT_CONTEXT_COMPACTION or AGENT_EVAL_FORCE_FINALIZE):
             return messages, ""
         threshold = min(AGENT_CONTEXT_COMPACT_THRESHOLD_TOKENS, TRAJECTORY_MAX_TOKENS)
         token_count = self.count_tokens(self._observation_masked_view(messages))
         if token_count < threshold:
             return messages, ""
-        if self._context_compaction_count:
+        if not AGENT_CONTEXT_COMPACTION:
+            return messages, "context soft limit reached without compaction"
+        if self._context_compaction_count >= AGENT_CONTEXT_COMPACT_MAX_COMPACTIONS:
             return messages, "context soft limit reached after compaction"
 
         # Count attempts as well as successes: a failed summary must not cause a loop.
@@ -3560,7 +3577,7 @@ class MultiTurnReactAgent(FnCallAgent):
                 prediction = ""
                 termination = "answer not found"
                 if (
-                    not AGENT_CONTEXT_COMPACTION
+                    not (AGENT_CONTEXT_COMPACTION or AGENT_EVAL_FORCE_FINALIZE)
                     or self.count_tokens(self._observation_masked_view(passin_messages))
                     < min(AGENT_CONTEXT_COMPACT_THRESHOLD_TOKENS, TRAJECTORY_MAX_TOKENS)
                 ):
@@ -3590,7 +3607,7 @@ class MultiTurnReactAgent(FnCallAgent):
                 finalization_reason = context_finalization_reason
 
             if (
-                (AGENT_EVAL_FORCE_FINALIZE or bool(context_finalization_reason))
+                AGENT_EVAL_FORCE_FINALIZE
                 and finalization_reason
                 and not self._extract_terminal_answer(content)
             ):

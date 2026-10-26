@@ -3,7 +3,7 @@ import os
 from typing import Any, Optional
 
 from file_tools.utils import encode_image_as_base64
-from prompt import SCIENCE_USER_TEMPLATE
+from prompt import SCIENCE_USER_TEMPLATE, SCIENCE_USER_TEMPLATE_PLAIN
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(CURRENT_DIR)
@@ -344,9 +344,13 @@ def build_initial_user_message(
     served_model_name: str,
     base_dir: Optional[str] = None,
 ) -> dict[str, Any]:
+    answer_type = os.getenv("AGENT_ANSWER_TYPE", "boxed").strip().lower()
+    if answer_type not in {"boxed", "plain"}:
+        raise ValueError("AGENT_ANSWER_TYPE must be 'boxed' or 'plain'")
+    template = SCIENCE_USER_TEMPLATE if answer_type == "boxed" else SCIENCE_USER_TEMPLATE_PLAIN
     text = question + question_suffix
-    if not text.startswith(SCIENCE_USER_TEMPLATE.format(question="").rstrip()):
-        text = SCIENCE_USER_TEMPLATE.format(question=text)
+    if not text.startswith(template.format(question="").rstrip()):
+        text = template.format(question=text)
     if not model_image_inputs_enabled():
         return {"role": "user", "content": text}
 

@@ -19,6 +19,16 @@ existing runs require extraction from saved full responses and rejudging.
 
 ## Context compaction and finalization
 
+`AGENT_ANSWER_TYPE=boxed` (default) selects the forced-finalization format:
+`<answer>`, a `Final Answer:` heading, and `\boxed{...}`. Set
+`AGENT_ANSWER_TYPE=plain` for an `<answer>...</answer>` example without the
+heading or box. Initial question wrapping, main finalization, and recovery
+finalization use the same setting, independent of keywords in the question.
+`boxed` preserves the existing question template; `plain` requests a complete
+response inside `<answer>` without adding a heading or box requirement. Neither
+setting changes extraction or grading. Apply overrides
+after loading local credentials if that file also defines this variable.
+
 `AGENT_CONTEXT_COMPACTION` remains disabled by default. To enable proactive
 compaction between turns, set these variables before starting the worker:
 
@@ -28,6 +38,10 @@ export AGENT_CONTEXT_COMPACT_THRESHOLD_TOKENS=57344  # 56 * 1024; default
 ```
 
 After a turn and its tool calls, the agent first accepts a valid final answer.
+With `AGENT_CONTEXT_COMPACTION=0` and `AGENT_EVAL_FORCE_FINALIZE=1`, reaching
+`AGENT_CONTEXT_COMPACT_THRESHOLD_TOKENS` triggers tool-free finalization directly,
+without generating a summary. Below that threshold, normal execution continues.
+With both switches disabled, the original behavior is preserved.
 Compaction preserves the system message, original user query (including images),
 and the latest complete assistant/tool turns. `AGENT_CONTEXT_COMPACT_RECENT_TURNS`
 defaults to 2; the final tool response belongs to these turns and is not handled
@@ -41,10 +55,13 @@ Only the summary body is copied back: separate reasoning fields are excluded;
 for raw Molt text, inline thinking through `</think>` and trailing message-end
 markers are removed. An unfinished `<think>` block supplies no summary body.
 This extraction does not alter the recorded summary-generation action.
-Otherwise, reaching the soft threshold triggers one compaction per task. After
-that, reaching the threshold again triggers the existing tool-free finalization
-request, even if `AGENT_EVAL_FORCE_FINALIZE=0`. Failed or ineffective compaction
-also leads to finalization. A successful context-error recovery compaction counts
+Reaching the soft threshold triggers compaction up to
+`AGENT_CONTEXT_COMPACT_MAX_COMPACTIONS` times per task (default 1). After that
+allowance is exhausted, reaching the threshold again triggers tool-free finalization only when
+`AGENT_EVAL_FORCE_FINALIZE=1`. Failed or ineffective compaction also leads to
+finalization only when that switch is enabled. With finalization disabled, the
+agent continues without another proactive compaction, subject to the original
+hard context, call and time limits. A successful context-error recovery compaction counts
 toward the same task limit. The counter resets for the next task and is returned
 as `context_compaction_count` (including proactive attempts that fail).
 
@@ -64,7 +81,8 @@ not exist, copy `sandbox.local.env.example` and fill `API_KEY` and
 `/v1`, for example `http://35.220.164.252:3888/v1`. Configure `SERPER_API_KEY`
 for real search and optional `JINA_API_KEY` for the page reader.
 
-The approved resource is `10.12.111.143/ailab-ma4agismall`.
+The default resource is `10.12.111.143/ailab-ai4sgi`, verified with sandbox
+creation and command execution using the current Token.
 The local configuration explicitly sets
 `SCIENCE_AGENT_SANDBOX_NETWORK_DEFAULT_ACTION=allow` for online tools.
 The client expresses this as default-deny with explicit allow rules for

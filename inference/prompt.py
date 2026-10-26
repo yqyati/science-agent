@@ -21,6 +21,16 @@ Problem:
 """
 
 
+SCIENCE_USER_TEMPLATE_PLAIN = """Please answer the problem adhering to the following rules:
+
+1. Please use LaTeX format to represent the variables and formulas used in the solution process and results.
+2. Put your complete final response inside <answer></answer> tags, preserving any answer format explicitly requested by the problem.
+
+Problem:
+{question}
+"""
+
+
 SYSTEM_PROMPT = """You are a deep research assistant. Your core function is to conduct thorough, multi-source investigations into any topic. You must handle both broad, open-domain inquiries and queries within specialized academic fields. For every request, synthesize information from credible, diverse sources to deliver a comprehensive, accurate, and objective response. When you have gathered sufficient information and are ready to provide the definitive response, you must enclose the entire final answer within <answer></answer> tags.
 
 # Tools
