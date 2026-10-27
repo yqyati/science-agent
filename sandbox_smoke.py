@@ -1,6 +1,7 @@
 """Live smoke test: bash run_sandbox_harness.sh python3 sandbox_smoke.py."""
 
 import argparse
+import asyncio
 import base64
 import io
 import hashlib
@@ -14,13 +15,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "inference"))
 
 from sandbox_gateway import close_shared_sandbox_run, shared_sandbox_run
 from tool_http_client import tool_http_request
+from judge_client import judge_answer, load_judge_chain
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--llm", action="store_true", help="Also call the summary LLM from the Sandbox")
     parser.add_argument("--page-file", action="store_true", help="Save a page in /workspace and read evidence with Python (requires qwen-agent)")
-    parser.add_argument("--judge", action="store_true", help="Test the configured evaluation judge through Sandbox")
+    parser.add_argument("--judge", action="store_true", help="Test the configured ordered Judge chain")
     parser.add_argument("--tools", action="store_true", help="Also run the real Search and Visit tools")
     parser.add_argument("--vision", action="store_true", help="Test input-image upload, crop/display, and matplotlib output")
     parser.add_argument("--search", action="store_true", help="Test Serper web and scholar search through Sandbox")
@@ -37,11 +39,7 @@ def main():
         if missing:
             parser.error("Fill sandbox.local.env: " + ", ".join(missing))
     if args.judge:
-        missing = [name for name in ("SCIENCE_AGENT_JUDGE_BASE_URL", "SCIENCE_AGENT_JUDGE_MODEL") if not os.getenv(name)]
-        if not (os.getenv("SCIENCE_AGENT_JUDGE_API_KEY") or os.getenv("API_KEY")):
-            missing.append("SCIENCE_AGENT_JUDGE_API_KEY or API_KEY")
-        if missing:
-            parser.error("Fill sandbox.local.env: " + ", ".join(missing))
+        load_judge_chain()
     retry_delays = (5, 15)
     for attempt in range(args.attempts):
         print(f"sandbox preflight attempt {attempt + 1}/{args.attempts}", flush=True)
@@ -177,29 +175,13 @@ def run_checks(args):
             assert "output truncated" in large, large[:100]
             print("page saved/Python tool read/cache/output limit: passed", flush=True)
         if args.judge:
-            judge_request = {
-                "method": "POST", "url": os.environ["SCIENCE_AGENT_JUDGE_BASE_URL"].rstrip("/") + "/chat/completions",
-                "headers": {"Authorization": "Bearer " + (os.getenv("SCIENCE_AGENT_JUDGE_API_KEY") or os.environ["API_KEY"])},
-                "json": {"model": os.environ["SCIENCE_AGENT_JUDGE_MODEL"], "temperature": 0.0,
-                         "max_tokens": int(os.getenv("SCIENCE_AGENT_JUDGE_MAX_TOKENS", "1800")),
-                         "response_format": {"type": "json_object"},
-                         "messages": [{"role": "user", "content": 'Grade candidate 2 against reference 2 for 1+1. Return JSON {"score": 1, "correct": true}.'}]},
-            }
-            retry_delays = (1, 5, 10, 30, 60, 180)
-            for attempt in range(len(retry_delays) + 1):
-                try:
-                    response = run.run_http(judge_request, timeout=float(os.getenv("SCIENCE_AGENT_JUDGE_TIMEOUT", "180")))
-                    assert response["status_code"] == 200, f"Judge HTTP {response['status_code']}: {response['text'][:500]}"
-                    grade = json.loads(json.loads(response["text"])["choices"][0]["message"]["content"])
-                    assert grade["score"] == 1 and grade["correct"] is True, grade
-                    break
-                except Exception as exc:
-                    print(f"judge attempt {attempt + 1}/{len(retry_delays) + 1} failed: {exc}", flush=True)
-                    if attempt == len(retry_delays):
-                        raise
-                    print(f"judge retry in {retry_delays[attempt]}s", flush=True)
-                    time.sleep(retry_delays[attempt])
-            print("judge", os.environ["SCIENCE_AGENT_JUDGE_MODEL"], "via Sandbox: passed", flush=True)
+            grade = asyncio.run(judge_answer(
+                [{"role": "user", "content": 'Grade candidate 2 against reference 2 for 1+1. Return JSON {"score": 1, "correct": true}.'}],
+                require_score=True, sandbox_run=run,
+            ))
+            assert grade["judge_result"] is not None, grade["judge_error"]
+            assert grade["judge_result"]["score"] == 1 and grade["judge_result"]["correct"] is True, "Judge failed the smoke question"
+            print("judge", grade["judge_name"], grade["judge_model"], "via", grade["judge_backend"], ": passed", flush=True)
         if args.tools:
             from tool_search_mcp_r1 import Search
             from tool_visit_mcp_r1 import Visit

@@ -486,3 +486,61 @@ Search defaults match the historical harness: 10 web results, all Scholar result
 and no additional snippet truncation. `SCIENCE_AGENT_SEARCH_SNIPPET_CHARS=0` and
 `SCIENCE_AGENT_SCHOLAR_SNIPPET_CHARS=0` disable snippet limits;
 `SCIENCE_AGENT_SCHOLAR_MAX_RESULTS=0` returns all provider entries.
+
+
+## Ordered Judge services
+
+`SCIENCE_AGENT_JUDGE_CONFIG` selects a UTF-8 JSON file containing a nonempty array
+of Judge services. Services run in array order. Copy `judge_services.example.json`
+and set the variable to an absolute path available to all rollout workers. Apply
+this override after any local environment loader. The example preserves the
+Sandbox Bailian Flash service followed by the internal direct Flash service,
+with reasoning effort 20 on the latter. API keys stay in environment variables;
+`api_key_env` names the variable, and omitting it sends `Bearer EMPTY`.
+
+Each entry has `name`, `transport` (`sandbox` or `direct`), `base_url` (ending in
+`/v1`), and `model`. Optional fields are:
+
+| Field | Behavior |
+|---|---|
+| `api_key_env` | Populated environment variable holding that service's key |
+| `retry_delays` | Waits between attempts; default `[1,5,10,30,60,180]` for Sandbox and `[]` for direct; each wait is at most 180 seconds |
+| `sandbox_replacements` | 0 or 1 per Sandbox service; direct requires 0 |
+| `timeout`, `max_tokens` | Per-request timeout and output budget; otherwise inherit existing Judge variables |
+| `thinking` | `enabled`, `disabled`, or empty to omit the vendor `thinking` field |
+| `thinking_format` | `thinking`, `chat_template_kwargs`, or `none`; independent of transport |
+| `reasoning_effort` | Integer 0–100 for thinking under `chat_template_kwargs`; default 20 |
+
+For `chat_template_kwargs`, an empty `thinking` retains the legacy direct-service
+behavior of enabling thinking. Use `disabled` to turn it off, or `none` for
+services accepting no thinking control. A Judge request always uses temperature
+0 and JSON response format. Services must accept OpenAI chat completions and
+return the grading schema requested in the prompt.
+
+A valid grade, including `correct=false`, ends the chain. Only transport errors,
+HTTP errors or invalid grading output advance it, after that service's retry
+and replacement allowance. Invalid output with thinking enabled first retries
+once with thinking disabled. All services receive the same saved answer and
+benchmark-specific prompt; rollout is never regenerated. Exhausting the chain
+retains the ungraded result (`-1`), rather than manufacturing a wrong grade.
+
+Sandbox services use `run_http`; direct services use host HTTP with environment
+proxies disabled and do not create or recover a Sandbox. The first Sandbox
+service reuses the task's Sandbox; replacements and later Sandbox services use
+fresh judge-only instances and close them afterward. The per-service allowance
+can create more than one replacement across a list with multiple Sandbox
+services; the default list still allows only one replacement in total.
+
+The Molt adapter and `sandbox_smoke.py --judge` share `inference/judge_client.py`,
+so preflight exercises the same chain. The overall smoke test still creates a
+Sandbox to verify Python and tools, even with a direct-only Judge list.
+`science_judge_name`, zero-based `science_judge_chain_index` and
+`science_judge_history` identify the selected service and preceding failures;
+existing Judge attempt, recovery and backend metrics remain available.
+
+Without `SCIENCE_AGENT_JUDGE_CONFIG`, the existing `SCIENCE_AGENT_JUDGE_*` primary
+and `SCIENCE_AGENT_JUDGE_FALLBACK_*` variables construct the same two-service
+chain. An empty fallback base URL disables that entry. No running worker is
+reconfigured automatically; use the new source and configuration on the next
+launch. The JSON file is loaded once per grading call; avoid editing an active
+run's file if reproducibility is required.
