@@ -12,3 +12,5 @@ __pycache__/
 .sandbox-env-*
 .cache/
 log/
+hle_api.local.env
+api_eval_runs/
