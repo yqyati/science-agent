@@ -1,0 +1,53 @@
+[
+  {
+    "name": "bailian-flash-sandbox",
+    "transport": "sandbox",
+    "base_url": "http://35.220.164.252:3888/v1",
+    "model": "bailian/deepseek-v4.1-flash",
+    "api_key_env": "API_KEY",
+    "thinking": "enabled",
+    "thinking_format": "thinking",
+    "max_tokens": 6000,
+    "timeout": 180,
+    "retry_delays": [
+      1,
+      5,
+      10,
+      30,
+      60,
+      180
+    ],
+    "sandbox_replacements": 1
+  },
+  {
+    "name": "tensoris-flash-sandbox",
+    "transport": "sandbox",
+    "base_url": "https://api.tensoris.ai/v1",
+    "model": "deepseek-v4.1-flash-1017",
+    "api_key_env": "TENSORIS_API_KEY",
+    "thinking_format": "none",
+    "max_tokens": 6000,
+    "timeout": 180,
+    "retry_delays": [
+      1,
+      5,
+      10,
+      30,
+      60,
+      180
+    ],
+    "sandbox_replacements": 1
+  },
+  {
+    "name": "internal-flash-direct",
+    "transport": "direct",
+    "base_url": "http://s-20261020163637-mpm6m.ailab-agentshared.pjh-service.org.cn/v1",
+    "model": "DeepSeek-V4.1-Flash-1017",
+    "thinking": "enabled",
+    "thinking_format": "chat_template_kwargs",
+    "reasoning_effort": 20,
+    "max_tokens": 6000,
+    "timeout": 180,
+    "retry_delays": []
+  }
+]
