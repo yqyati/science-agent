@@ -267,6 +267,22 @@ class ProactiveCompactionTests(unittest.TestCase):
         self.assertEqual(self.agent.call_server.call_args.kwargs["tool_schemas"], [])
         self.assertEqual(self.agent.call_server.call_args.args[0][-1]["content"], "Finalize")
 
+    def test_only_molt_finalization_requests_token_append(self):
+        self.agent._clean_limit_apology = lambda text: text
+        self.agent.max_output_tokens = 8
+        for molt in (False, True):
+            with self.subTest(molt=molt), patch.dict(namespace, {
+                "AGENT_EVAL_FORCE_FINALIZE": True,
+                "AGENT_EVAL_FORCE_FINAL_MAX_OUTPUT_TOKENS": 8,
+                "AGENT_EVAL_FORCE_FINAL_DISABLE_THINKING": False,
+            }):
+                self.agent._molt_append_finalization = molt
+                self.agent.call_server = Mock(return_value=(SimpleNamespace(content="<answer>42</answer>", tool_calls=None), {}))
+                namespace["Agent"]._attempt_forced_finalization(self.agent, [{"role": "user", "content": "Q"}],
+                                                               None, "Q", "soft limit")
+                extra = self.agent.call_server.call_args.kwargs["request_extra_body"]
+                self.assertEqual(extra, {"molt_append_finalization": True} if molt else {})
+
     def test_compact_only_continues_after_second_crossing_without_finalizing(self):
         with patch.dict(namespace, {"AGENT_EVAL_FORCE_FINALIZE": False}):
             result = self.run_task(["x" * 56, "y" * 56, "<answer>42</answer>"])

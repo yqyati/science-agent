@@ -3145,8 +3145,10 @@ class MultiTurnReactAgent(FnCallAgent):
             forced_extra_body = (
                 {"thinking": {"type": "disabled"}}
                 if AGENT_EVAL_FORCE_FINAL_DISABLE_THINKING
-                else None
+                else {}
             )
+            if getattr(self, "_molt_append_finalization", False):
+                forced_extra_body["molt_append_finalization"] = True
             response, usage = self.call_server(
                 self._observation_masked_view(final_messages),
                 planning_port,
