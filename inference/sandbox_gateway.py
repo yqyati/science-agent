@@ -34,6 +34,10 @@ class SandboxGatewayError(RuntimeError):
     pass
 
 
+class SandboxQuotaExceededError(SandboxGatewayError):
+    """The gateway explicitly rejected creation because the resource pool is full."""
+
+
 class SandboxInactiveError(SandboxGatewayError):
     """Management API confirmed that the addressed Sandbox is unavailable."""
 
@@ -129,6 +133,13 @@ class SandboxGatewayClient:
                     time.sleep(attempt + 1)
                     continue
                 error = SandboxGatewayError
+                if method == "POST" and path == "/v1/sandboxes" and exc.code == 429:
+                    try:
+                        info = json.loads(detail).get("detail", {})
+                    except (ValueError, AttributeError):
+                        info = {}
+                    if isinstance(info, dict) and info.get("code") == "QUOTA_EXCEEDED":
+                        error = SandboxQuotaExceededError
                 if method == "GET" and path.startswith("/v1/sandboxes/"):
                     try:
                         info = json.loads(detail).get("detail", {})
@@ -163,6 +174,8 @@ class SandboxGatewayClient:
         if network_policy is not None:
             payload["networkPolicy"] = network_policy
         retry_delays = (1, 5, 10)
+        quota_groups = {"ailab-ai4sgi": "ailab-ma4agismall", "ailab-ma4agismall": "ailab-ai4sgi"}
+        quota_switched = False
         for attempt in range(len(retry_delays) + 1):
             try:
                 data = self._request("POST", "/v1/sandboxes", payload)
@@ -176,6 +189,19 @@ class SandboxGatewayClient:
                     raise
                 if attempt == len(retry_delays):
                     raise SandboxGatewayError(f"Sandbox create failed after {attempt + 1} attempts: {exc}") from exc
+                cluster, separator, group = (self.resource or "").rpartition("/")
+                if isinstance(exc, SandboxQuotaExceededError) and separator and group in quota_groups:
+                    previous = self.resource
+                    self.resource = cluster + "/" + quota_groups[group]
+                    delay = retry_delays[attempt] if quota_switched else 0
+                    quota_switched = True
+                    logging.getLogger(__name__).warning(
+                        "Sandbox create quota exhausted resource=%s; retry resource=%s attempt=%d/4 delay=%ss",
+                        previous, self.resource, attempt + 2, delay,
+                    )
+                    if delay:
+                        time.sleep(delay)
+                    continue
                 # Creation retries must not replay command or tool POSTs. Without
                 # server idempotency, a lost response can leave an unknown instance.
                 logging.getLogger(__name__).warning(

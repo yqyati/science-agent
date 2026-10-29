@@ -379,6 +379,14 @@ Recovery returns the normal tool result; exhausted retries return an error.
 Python execution response timeouts and generic 502 errors are not replayed
 because the worker may already have executed stateful code.
 
+Sandbox creation defaults to `10.12.111.143/ailab-ai4sgi`. An explicit HTTP 429
+with `detail.code=QUOTA_EXCEEDED` switches between `ailab-ai4sgi` and
+`ailab-ma4agismall` under the same resource cluster. The first switch is immediate;
+subsequent failures use the existing backoff, with at most four creation attempts
+in total. Other errors and custom resource groups retain their existing retries.
+The selected resource stays on the client for queries, tools and deletion;
+existing instances are never migrated between groups.
+
 Budget termination: Agent results distinguish generation_truncated from
 trajectory_budget_exhausted and propagate their OR through Result.truncated
 in the isolated Molt adapter, allowing session capture to mark the final

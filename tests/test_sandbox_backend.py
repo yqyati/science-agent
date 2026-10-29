@@ -24,6 +24,66 @@ import tool_http_client as transport
 RealGatewayClient = gateway.SandboxGatewayClient
 
 
+class SandboxQuotaFallbackTests(unittest.TestCase):
+    def test_quota_rejection_switches_immediately_and_retains_resource(self):
+        for primary, fallback in [("ailab-ai4sgi", "ailab-ma4agismall"),
+                                  ("ailab-ma4agismall", "ailab-ai4sgi")]:
+            with self.subTest(primary=primary):
+                client = RealGatewayClient("http://gateway", "test-token", "cluster/" + primary)
+                error = HTTPError("http://gateway", 429, "Quota", {}, io.BytesIO(
+                    b'{"detail":{"code":"QUOTA_EXCEEDED"}}'))
+                replies = [error, io.BytesIO(b'{"id":"sid"}'),
+                           io.BytesIO(b'{"endpoint":"http://worker"}'), io.BytesIO(b'{}')]
+                with patch.object(gateway.urllib.request, "urlopen", side_effect=replies) as request, \
+                        patch.object(gateway.time, "sleep") as sleep:
+                    self.assertEqual(client.create(image="image"), "sid")
+                    _, headers = client.endpoint("sid")
+                    self.assertEqual(headers["X-Sandbox-Resource"], "cluster/" + fallback)
+                    client.delete("sid")
+                resources = [dict((k.lower(), v) for k, v in call.args[0].header_items())[
+                    "x-sandbox-resource"] for call in request.call_args_list]
+                self.assertEqual(resources, ["cluster/" + primary] + ["cluster/" + fallback] * 3)
+                sleep.assert_not_called()
+
+    def test_both_groups_full_remains_bounded_and_waits(self):
+        client = RealGatewayClient("http://gateway", "test-token", "cluster/ailab-ai4sgi")
+        errors = [HTTPError("http://gateway", 429, "Quota", {}, io.BytesIO(
+            b'{"detail":{"code":"QUOTA_EXCEEDED"}}')) for _ in range(4)]
+        with patch.object(gateway.urllib.request, "urlopen", side_effect=errors) as request, \
+                patch.object(gateway.time, "sleep") as sleep:
+            with self.assertRaisesRegex(gateway.SandboxGatewayError, "failed after 4 attempts"):
+                client.create(image="image")
+        self.assertEqual(request.call_count, 4)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [5, 10])
+        resources = [call.args[0].get_header("X-sandbox-resource") for call in request.call_args_list]
+        self.assertEqual(resources, ["cluster/ailab-ai4sgi", "cluster/ailab-ma4agismall"] * 2)
+
+    def test_other_errors_retry_without_changing_resource(self):
+        for status, body in [(429, b'{"detail":{"code":"RATE_LIMITED"}}'),
+                             (429, b'not JSON'), (502, b'{"detail":{"code":"QUOTA_EXCEEDED"}}')]:
+            with self.subTest(status=status, body=body):
+                client = RealGatewayClient("http://gateway", "test-token", "cluster/ailab-ai4sgi")
+                error = HTTPError("http://gateway", status, "Rejected", {}, io.BytesIO(body))
+                with patch.object(gateway.urllib.request, "urlopen", side_effect=[error, io.BytesIO(b'{"id":"sid"}')]), \
+                        patch.object(gateway.time, "sleep") as sleep:
+                    self.assertEqual(client.create(image="image"), "sid")
+                self.assertEqual(client.resource, "cluster/ailab-ai4sgi")
+                sleep.assert_called_once_with(1)
+
+    def test_other_resource_pool_and_tool_posts_never_switch(self):
+        for resource, path in [("cluster/custom", "/v1/sandboxes"),
+                               ("cluster/ailab-ai4sgi", "/v1/sandboxes/sid/command")]:
+            with self.subTest(resource=resource, path=path):
+                client = RealGatewayClient("http://gateway", "test-token", resource)
+                error = HTTPError("http://gateway", 429, "Quota", {}, io.BytesIO(
+                    b'{"detail":{"code":"QUOTA_EXCEEDED"}}'))
+                with patch.object(gateway.urllib.request, "urlopen", side_effect=error) as request:
+                    with self.assertRaises(gateway.SandboxGatewayError):
+                        client._request("POST", path, {})
+                self.assertEqual(client.resource, resource)
+                self.assertEqual(request.call_count, 1)
+
+
 class SandboxTokenReloadTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
