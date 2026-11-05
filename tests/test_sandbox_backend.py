@@ -26,12 +26,16 @@ RealGatewayClient = gateway.SandboxGatewayClient
 
 class SandboxQuotaFallbackTests(unittest.TestCase):
     def test_quota_rejection_switches_immediately_and_retains_resource(self):
-        for primary, fallback in [("ailab-ai4sgi", "ailab-ma4agismall"),
-                                  ("ailab-ma4agismall", "ailab-ai4sgi")]:
-            with self.subTest(primary=primary):
+        for primary, fallback, code in [
+            (primary, fallback, code)
+            for primary, fallback in [("ailab-ai4sgi", "ailab-ma4agismall"),
+                                      ("ailab-ma4agismall", "ailab-ai4sgi")]
+            for code in ("QUOTA_EXCEEDED", "USER_QUOTA_EXCEEDED")
+        ]:
+            with self.subTest(primary=primary, code=code):
                 client = RealGatewayClient("http://gateway", "test-token", "cluster/" + primary)
                 error = HTTPError("http://gateway", 429, "Quota", {}, io.BytesIO(
-                    b'{"detail":{"code":"QUOTA_EXCEEDED"}}'))
+                    json.dumps({"detail": {"code": code}}).encode()))
                 replies = [error, io.BytesIO(b'{"id":"sid"}'),
                            io.BytesIO(b'{"endpoint":"http://worker"}'), io.BytesIO(b'{}')]
                 with patch.object(gateway.urllib.request, "urlopen", side_effect=replies) as request, \
@@ -48,7 +52,8 @@ class SandboxQuotaFallbackTests(unittest.TestCase):
     def test_both_groups_full_remains_bounded_and_waits(self):
         client = RealGatewayClient("http://gateway", "test-token", "cluster/ailab-ai4sgi")
         errors = [HTTPError("http://gateway", 429, "Quota", {}, io.BytesIO(
-            b'{"detail":{"code":"QUOTA_EXCEEDED"}}')) for _ in range(4)]
+            json.dumps({"detail": {"code": code}}).encode()))
+            for code in ("USER_QUOTA_EXCEEDED", "QUOTA_EXCEEDED") * 2]
         with patch.object(gateway.urllib.request, "urlopen", side_effect=errors) as request, \
                 patch.object(gateway.time, "sleep") as sleep:
             with self.assertRaisesRegex(gateway.SandboxGatewayError, "failed after 4 attempts"):

@@ -138,7 +138,7 @@ class SandboxGatewayClient:
                         info = json.loads(detail).get("detail", {})
                     except (ValueError, AttributeError):
                         info = {}
-                    if isinstance(info, dict) and info.get("code") == "QUOTA_EXCEEDED":
+                    if isinstance(info, dict) and info.get("code") in {"QUOTA_EXCEEDED", "USER_QUOTA_EXCEEDED"}:
                         error = SandboxQuotaExceededError
                 if method == "GET" and path.startswith("/v1/sandboxes/"):
                     try:
