@@ -3132,6 +3132,13 @@ class MultiTurnReactAgent(FnCallAgent):
             return None, {}
 
         final_messages = copy.deepcopy(passin_messages)
+        # Finalization may skip pending tools; keep only calls with completed responses.
+        completed_tool_ids = {m.get("tool_call_id") for m in final_messages if m.get("role") == "tool"}
+        for message in final_messages:
+            if message.get("tool_calls"):
+                message["tool_calls"] = [call for call in message["tool_calls"] if call.get("id") in completed_tool_ids]
+                if not message["tool_calls"]:
+                    message.pop("tool_calls")
         final_messages.append(
             self._build_forced_finalization_user_message(question, reason)
         )
@@ -3156,7 +3163,6 @@ class MultiTurnReactAgent(FnCallAgent):
                 max_output_tokens=forced_max_output_tokens,
                 request_extra_body=forced_extra_body,
                 retry_incomplete_output=False,
-                request_temperature=0.0,
                 request_presence_penalty=0.0,
             )
         except IncompleteOutputError as exc:
@@ -3243,7 +3249,6 @@ class MultiTurnReactAgent(FnCallAgent):
                         "thinking": {"type": "disabled"},
                     },
                     retry_incomplete_output=False,
-                    request_temperature=0.0,
                     request_presence_penalty=0.0,
                 )
                 merge_usage_dict(partial_usage, recovery_usage)
@@ -3491,12 +3496,17 @@ class MultiTurnReactAgent(FnCallAgent):
                 )
             )
 
-            if tool_calls is not None and len(tool_calls) > 0:
+            finalization_reason = ""
+            if tool_calls and AGENT_EVAL_FORCE_FINALIZE and not AGENT_CONTEXT_COMPACTION:
+                _, finalization_reason = self._compact_at_soft_limit(passin_messages)
+
+            if not finalization_reason and tool_calls is not None and len(tool_calls) > 0:
                 turn_tool_messages = []
                 turn_tool_names = []
                 turn_tool_args = []
                 turn_tool_responses = []
                 for tool in tool_calls:
+                    tool_call_count += 1
                     raw_tool_args = ""
                     try:
                         tool_name = tool.function.name
@@ -3558,6 +3568,12 @@ class MultiTurnReactAgent(FnCallAgent):
                         "name": schema_name,
                         "content": tool_response,
                     }
+                    if AGENT_EVAL_FORCE_FINALIZE and not AGENT_CONTEXT_COMPACTION:
+                        _, finalization_reason = self._compact_at_soft_limit(passin_messages + [tool_message])
+                        if finalization_reason:
+                            emit_trace("tool_result_omitted_at_soft_limit", layer="agent_loop",
+                                       round_idx=round_idx, tool_call_id=tool.id, tool=schema_name)
+                            break
                     tool_response_text = tool_content_to_text(tool_response)
                     turn_tool_names.append(schema_name)
                     turn_tool_args.append(copy.deepcopy(tool_args))
@@ -3565,9 +3581,8 @@ class MultiTurnReactAgent(FnCallAgent):
                     turn_tool_messages.append(copy.deepcopy(tool_message))
                     messages.append(tool_message)
                     passin_messages.append(copy.deepcopy(tool_message))
-                tool_call_count += len(tool_calls)
 
-            else:
+            elif not finalization_reason:
                 terminal_answer = self._extract_terminal_answer(content)
                 if terminal_answer:
                     prediction = terminal_answer
@@ -3592,14 +3607,14 @@ class MultiTurnReactAgent(FnCallAgent):
                 ):
                     messages[-1]["content"] = "Sorry, the number of llm calls exceeds the limit."
 
-            finalization_reason = ""
             if (
-                MAX_TOOL_CALLS_PER_RUN > 0
+                not finalization_reason
+                and MAX_TOOL_CALLS_PER_RUN > 0
                 and tool_call_count >= MAX_TOOL_CALLS_PER_RUN
             ):
                 num_llm_calls_available = 0
                 finalization_reason = "tool call budget reached"
-            elif num_llm_calls_available <= 0:
+            elif not finalization_reason and num_llm_calls_available <= 0:
                 finalization_reason = "llm call budget reached"
 
             context_finalization_reason = ""

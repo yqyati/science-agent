@@ -242,6 +242,29 @@ class ProactiveCompactionTests(unittest.TestCase):
         self.compactor._compact_messages.assert_not_called()
         self.agent._attempt_forced_finalization.assert_called_once()
         self.assertEqual(self.agent.call_server.call_count, 1)
+        self.assertFalse(any(m.get("role") == "tool" for m in result["messages"]))
+        context = self.agent._attempt_forced_finalization.call_args.args[0]
+        self.assertFalse(any(m.get("role") == "tool" for m in context))
+
+    def test_soft_limit_in_model_response_skips_pending_tools(self):
+        tool = SimpleNamespace(id="call1", type="function",
+                               function=SimpleNamespace(name="python", arguments="{}"))
+        self.agent.custom_call_tool = Mock()
+        with patch.dict(namespace, {"AGENT_CONTEXT_COMPACTION": False, "AGENT_EVAL_FORCE_FINALIZE": True}):
+            result = self.run_task([SimpleNamespace(content="x" * 56, tool_calls=[tool])])
+        self.agent.custom_call_tool.assert_not_called()
+        self.agent._attempt_forced_finalization.assert_called_once()
+        self.assertEqual(result["prediction"], "42")
+
+    def test_oversized_tool_result_skips_remaining_tools(self):
+        tools = [SimpleNamespace(id=f"call{i}", type="function",
+                                 function=SimpleNamespace(name="python", arguments="{}")) for i in range(2)]
+        self.agent.custom_call_tool = Mock(return_value="t" * 56)
+        with patch.dict(namespace, {"AGENT_CONTEXT_COMPACTION": False, "AGENT_EVAL_FORCE_FINALIZE": True}):
+            result = self.run_task([SimpleNamespace(content="", tool_calls=tools)])
+        self.agent.custom_call_tool.assert_called_once()
+        self.assertFalse(any(m.get("role") == "tool" for m in result["messages"]))
+        self.assertEqual(result["prediction"], "42")
 
     def test_finalize_only_below_threshold_and_valid_answer_do_not_force(self):
         with patch.dict(namespace, {"AGENT_CONTEXT_COMPACTION": False, "AGENT_EVAL_FORCE_FINALIZE": True}):
@@ -265,6 +288,7 @@ class ProactiveCompactionTests(unittest.TestCase):
         self.assertEqual(result["prediction"], "42")
         self.assertEqual(self.agent.call_server.call_count, 3)
         self.assertEqual(self.agent.call_server.call_args.kwargs["tool_schemas"], [])
+        self.assertIsNone(self.agent.call_server.call_args.kwargs.get("request_temperature"))
         self.assertEqual(self.agent.call_server.call_args.args[0][-1]["content"], "Finalize")
 
     def test_only_molt_finalization_requests_token_append(self):
@@ -282,6 +306,21 @@ class ProactiveCompactionTests(unittest.TestCase):
                                                                None, "Q", "soft limit")
                 extra = self.agent.call_server.call_args.kwargs["request_extra_body"]
                 self.assertEqual(extra, {"molt_append_finalization": True} if molt else {})
+
+    def test_finalizer_removes_unanswered_tool_calls(self):
+        self.agent._clean_limit_apology = lambda text: text
+        self.agent.max_output_tokens = 8
+        self.agent.call_server = Mock(return_value=(SimpleNamespace(content="<answer>42</answer>", tool_calls=None), {}))
+        messages = [{"role": "assistant", "content": "analysis",
+                     "tool_calls": [{"id": "done"}, {"id": "skipped"}]},
+                    {"role": "tool", "tool_call_id": "done", "content": "evidence"}]
+        with patch.dict(namespace, {"AGENT_EVAL_FORCE_FINALIZE": True,
+                                   "AGENT_EVAL_FORCE_FINAL_MAX_OUTPUT_TOKENS": 8,
+                                   "AGENT_EVAL_FORCE_FINAL_DISABLE_THINKING": False}):
+            namespace["Agent"]._attempt_forced_finalization(self.agent, messages, None, "Q", "soft limit")
+        sent = self.agent.call_server.call_args.args[0]
+        self.assertEqual(sent[0]["tool_calls"], [{"id": "done"}])
+        self.assertEqual(len(messages[0]["tool_calls"]), 2)
 
     def test_compact_only_continues_after_second_crossing_without_finalizing(self):
         with patch.dict(namespace, {"AGENT_EVAL_FORCE_FINALIZE": False}):

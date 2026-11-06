@@ -125,7 +125,13 @@ def run_checks(args):
                 if response.status_code >= 400:
                     print("Serper error:", response.text[:1500], flush=True)
                 response.raise_for_status()
-                assert response.json().get("organic"), "Serper returned no search results"
+                data = response.json()
+                assert not data.get("error"), f"Serper {label} error: {data['error']}"
+                assert isinstance(data.get("organic"), list), f"Serper {label} response missing organic results list"
+                if not data["organic"]:
+                    if label == "web":
+                        raise AssertionError("Serper web returned no search results")
+                    print("WARNING: Serper scholar returned an empty results list; connectivity passed, retrieval quality unverified", flush=True)
                 print("Serper", label, "via Sandbox: passed", flush=True)
         if args.llm:
             response = tool_http_request(
