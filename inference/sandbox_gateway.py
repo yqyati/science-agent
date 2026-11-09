@@ -213,7 +213,44 @@ class SandboxGatewayClient:
         sandbox_id = str((data or {}).get("id") or "")
         if not sandbox_id:
             raise SandboxGatewayError(f"create response has no sandbox id: {data!r}")
+        try:
+            self._record_lifecycle(sandbox_id, "created")
+        except OSError:
+            # A run must not continue with an instance missing from its cleanup ledger.
+            logging.getLogger(__name__).exception("Sandbox ledger write failed id=%s", sandbox_id)
+            try:
+                self._request("DELETE", f"/v1/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}")
+            except Exception:
+                logging.getLogger(__name__).exception("Unrecorded Sandbox cleanup failed id=%s resource=%s", sandbox_id, self.resource)
+            raise
         return sandbox_id
+
+    def _record_lifecycle(self, sandbox_id: str, status: str) -> None:
+        directory = os.getenv("SCIENCE_AGENT_SANDBOX_LEDGER_DIR")
+        trace = os.getenv("SCIENCE_AGENT_TRACE_FILE")
+        if not directory and trace:
+            directory = str(Path(trace).parent / "sandbox_ledger")
+        if not directory:
+            return
+        root = Path(directory)
+        root.mkdir(parents=True, exist_ok=True)
+        name = hashlib.sha256(f"{self.base_url}\n{self.resource}\n{sandbox_id}".encode()).hexdigest()
+        target = root / f"{name}.json"
+        record = json.loads(target.read_text()) if target.exists() else {
+            "sandbox_id": sandbox_id, "resource": self.resource, "base_url": self.base_url,
+            "run_name": os.getenv("RUN_NAME") or os.getenv("RJOB_NAME") or "",
+            "created_at": time.time(), "pid": os.getpid(),
+        }
+        record.update(status=status, updated_at=time.time())
+        temporary = root / f".{name}.{uuid.uuid4().hex}.tmp"
+        try:
+            with temporary.open("x") as handle:
+                json.dump(record, handle, ensure_ascii=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def detail(self, sandbox_id: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}")
@@ -365,6 +402,7 @@ class SandboxGatewayClient:
 
     def delete(self, sandbox_id: str) -> None:
         self._request("DELETE", f"/v1/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}")
+        self._record_lifecycle(sandbox_id, "deleted")
 
 
 class AgentSandboxRun:

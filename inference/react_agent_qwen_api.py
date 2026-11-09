@@ -3156,6 +3156,8 @@ class MultiTurnReactAgent(FnCallAgent):
             )
             if getattr(self, "_molt_append_finalization", False):
                 forced_extra_body["molt_append_finalization"] = True
+            forced_temperature = os.getenv("AGENT_EVAL_FORCE_FINAL_TEMPERATURE")
+            forced_temperature = float(forced_temperature) if forced_temperature is not None else None
             response, usage = self.call_server(
                 self._observation_masked_view(final_messages),
                 planning_port,
@@ -3164,6 +3166,7 @@ class MultiTurnReactAgent(FnCallAgent):
                 request_extra_body=forced_extra_body,
                 retry_incomplete_output=False,
                 request_presence_penalty=0.0,
+                request_temperature=forced_temperature,
             )
         except IncompleteOutputError as exc:
             partial_response = exc.partial_response
@@ -3250,6 +3253,7 @@ class MultiTurnReactAgent(FnCallAgent):
                     },
                     retry_incomplete_output=False,
                     request_presence_penalty=0.0,
+                    request_temperature=forced_temperature,
                 )
                 merge_usage_dict(partial_usage, recovery_usage)
                 usage = partial_usage

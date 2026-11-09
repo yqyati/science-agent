@@ -14,6 +14,7 @@ import time
 import httpx
 from runtime_env import get_env_float, get_env_int
 from tool_http_client import tool_http_config, tool_http_request
+from jina_key_failover import request_with_jina_key_failover
 from sandbox_gateway import shared_sandbox_run
 from tool_provider_strategy import provider_strategy, strategy_visit
 from tool_url_guard import (
@@ -593,12 +594,15 @@ class Visit(BaseTool):
             headers["X-Return-Format"] = "markdown"
             for attempt in range(_visit_read_max_retries()):
                 try:
-                    result = shared_sandbox_run().run_http({
-                        "method": "GET", "url": request_url, "headers": headers,
-                        "save_page": True, "source_url": url,
-                        "guard_snapshot": context.snapshot.to_dict(),
-                        "guard_fingerprint": guard_fingerprint(context),
-                    }, timeout=tool_http_config("JINA")["max_time"])
+                    result = request_with_jina_key_failover(
+                        lambda request_headers: shared_sandbox_run().run_http({
+                            "method": "GET", "url": request_url, "headers": request_headers,
+                            "save_page": True, "source_url": url,
+                            "guard_snapshot": context.snapshot.to_dict(),
+                            "guard_fingerprint": guard_fingerprint(context),
+                        }, timeout=tool_http_config("JINA")["max_time"]),
+                        url=request_url, headers=headers,
+                    )
                     if result["status_code"] == 200:
                         page = dict(result["page"])
                         page.pop("absolute_path", None)

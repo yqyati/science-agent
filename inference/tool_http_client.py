@@ -13,6 +13,7 @@ import requests
 from sandbox_gateway import SandboxGatewayError, SandboxStateError, shared_sandbox_run, close_shared_sandbox_run
 
 from runtime_env import get_env_bool, get_env_float, get_env_value
+from jina_key_failover import request_with_jina_key_failover
 
 try:
     from science_agent.tracing import emit_trace
@@ -271,7 +272,16 @@ def _curl_call(
     )
 
 
-def tool_http_request(
+def tool_http_request(**kwargs) -> ToolHttpResponse:
+    if kwargs.get("prefix", "").upper() != "JINA":
+        return _tool_http_request(**kwargs)
+    return request_with_jina_key_failover(
+        lambda headers: _tool_http_request(**{**kwargs, "headers": headers}),
+        url=kwargs["url"], headers=kwargs.get("headers"),
+    )
+
+
+def _tool_http_request(
     *,
     prefix: str,
     method: str,
