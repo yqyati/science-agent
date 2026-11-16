@@ -3091,6 +3091,15 @@ class MultiTurnReactAgent(FnCallAgent):
             )
             example_answer = "XXXX"
             example_guidance = ""
+        if (os.getenv("SCIENCE_AGENT_FSR_COMPLETE_SOLUTION") == "1"
+                and os.getenv("SCIENCE_AGENT_EVAL_BENCHMARK") == "frontierscience_research"):
+            format_line = (
+                "Inside <answer>, restate and organize the necessary assumptions, key derivations, "
+                "formulas, calculations, supporting evidence, and the answer to every sub-question, "
+                "even if already developed during earlier thinking or tool use. Do not use 'see above' "
+                "or refer to earlier reasoning instead of including the solution. Put each final result "
+                "in \\boxed{...}, in the requested order; keep derivations outside the boxes but inside <answer>."
+            )
         return {
             "role": "user",
             "content": (

@@ -133,7 +133,7 @@ class SandboxGatewayClient:
                     time.sleep(attempt + 1)
                     continue
                 error = SandboxGatewayError
-                if method == "POST" and path == "/v1/sandboxes" and exc.code == 429:
+                if method == "POST" and path == "/v1/sandboxes" and exc.code in {403, 429}:
                     try:
                         info = json.loads(detail).get("detail", {})
                     except (ValueError, AttributeError):

@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import time
+import shlex
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "inference"))
@@ -12,10 +13,13 @@ from sandbox_gateway import SandboxGatewayClient
 
 
 def main():
+    default_env = Path(__file__).resolve().with_name("sandbox.local.env")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ledger-dir", required=True, type=Path)
     parser.add_argument("--run-name", required=True, help="Exact RUN_NAME of the stopped run")
     parser.add_argument("--delete", action="store_true", help="Delete pending instances; default only lists them")
+    parser.add_argument("--env-file", type=Path, default=default_env,
+                        help=f"Sandbox credential env file (default: {default_env})")
     args = parser.parse_args()
     if not args.ledger_dir.is_dir():
         parser.error(f"Ledger directory does not exist: {args.ledger_dir}")
@@ -29,9 +33,22 @@ def main():
             pending.append(record)
         elif record["status"] != "deleted":
             parser.error(f"Unknown status in {path.name}")
+    # Cleanup runs outside the training process. Load only the credential value;
+    # never source the file as shell code.
     token = os.getenv("OPEN_SANDBOX_GATEWAY_TOKEN", "")
+    if not token and args.env_file.is_file():
+        for line in args.env_file.read_text().splitlines():
+            line = line.strip().removeprefix("export ").strip()
+            key, sep, value = line.partition("=")
+            if sep and key.strip() == "OPEN_SANDBOX_GATEWAY_TOKEN":
+                values = shlex.split(value, comments=True)
+                if len(values) == 1:
+                    token = values[0]
+                    break
     if args.delete and pending and not token:
-        parser.error("Missing OPEN_SANDBOX_GATEWAY_TOKEN; launch through run_sandbox_harness.sh")
+        parser.error(f"Missing OPEN_SANDBOX_GATEWAY_TOKEN; set it or provide --env-file (tried {args.env_file})")
+    if token:
+        os.environ["SANDBOX_LOCAL_ENV_FILE"] = str(args.env_file.resolve())
     failures = 0
     os.environ["SCIENCE_AGENT_SANDBOX_LEDGER_DIR"] = str(args.ledger_dir)
     for record in pending:
