@@ -22,7 +22,7 @@ tree = ast.parse(SOURCE.read_text())
 agent = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "MultiTurnReactAgent")
 names = {"_clean_limit_apology", "_extract_answer_block", "_extract_last_boxed",
          "_extract_final_answer_block", "_extract_terminal_answer"}
-namespace = {"re": re, "find_boxed_spans": find_boxed_spans,
+namespace = {"re": re, "os": os, "find_boxed_spans": find_boxed_spans,
              "last_anchored_final_answer_region": last_anchored_final_answer_region,
              "select_hle_candidate": select_hle_candidate}
 methods = [n for n in agent.body if isinstance(n, ast.FunctionDef) and n.name in names]
@@ -62,6 +62,27 @@ class TerminalAnswerTests(unittest.TestCase):
 
     def test_explicit_answer_block_still_takes_precedence(self):
         self.assertEqual(self.extract("Final Answer:\n\\boxed{A}\\boxed{B}\n<answer>C</answer>"), "C")
+
+    def test_imo_excludes_boxed_intermediate_claim(self):
+        text = "<answer>Necessary condition: \\boxed{n=0,1\\pmod4}.\nFinal Answer:\n\\boxed{305}</answer>"
+        with patch.dict(os.environ, {"SCIENCE_AGENT_EVAL_BENCHMARK": "imo_answerbench"}):
+            self.assertEqual(self.extract(text), "Final Answer:\n" + r"\boxed{305}")
+
+    def test_imo_keeps_all_final_answers_after_last_marker(self):
+        text = "<answer>Final Answer:\n\\boxed{draft}\n**Final Answers:**\n\\boxed{2}\n\\boxed{3}</answer>"
+        with patch.dict(os.environ, {"SCIENCE_AGENT_EVAL_BENCHMARK": "imo_answerbench"}):
+            self.assertEqual(self.extract(text), "Final Answer:\n\\boxed{2}\n\\boxed{3}")
+
+    def test_imo_falls_back_without_visible_final_marker(self):
+        text = "Final Answer:\n\\boxed{draft}</think><answer>\\boxed{2}\\boxed{3}</answer>"
+        with patch.dict(os.environ, {"SCIENCE_AGENT_EVAL_BENCHMARK": "imo_answerbench"}):
+            self.assertEqual(self.extract(text), "Final Answer:\n" + r"\boxed{2}\boxed{3}")
+
+    def test_imo_selection_does_not_change_other_benchmarks(self):
+        text = "<answer>Intermediate \\boxed{1}.\nFinal Answer:\n\\boxed{305}</answer>"
+        for benchmark in ("hle_all_mini", "amobench", "hipho"):
+            with self.subTest(benchmark=benchmark), patch.dict(os.environ, {"SCIENCE_AGENT_EVAL_BENCHMARK": benchmark}):
+                self.assertEqual(self.extract(text), text[len("<answer>"):-len("</answer>")])
 
     def test_uses_last_final_region_and_ignores_reasoning_boxes(self):
         text = "Final Answer:\n\\boxed{draft1}\\boxed{draft2}</think>\nFinal Answer:\n\\boxed{old1}\\boxed{old2}\nFinal Answer:\n\\boxed{3}\\boxed{5}"

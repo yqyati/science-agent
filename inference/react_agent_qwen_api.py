@@ -3034,6 +3034,13 @@ class MultiTurnReactAgent(FnCallAgent):
 
     def _extract_terminal_answer(self, text: str) -> str:
         answer_block = self._extract_answer_block(text)
+        if os.getenv("SCIENCE_AGENT_EVAL_BENCHMARK", "") == "imo_answerbench":
+            # IMO's downstream grader collects every box. Restrict it to an
+            # explicit final section so boxed intermediate claims stay out.
+            visible = answer_block or self._clean_limit_apology(text).rsplit("</think>", 1)[-1]
+            final_region = last_anchored_final_answer_region(visible)
+            if final_region and final_region.content:
+                return "Final Answer:\n" + final_region.content
         if answer_block:
             # The downstream HLE selector needs a terminal-region marker to
             # retain multiple boxes after we remove the <answer> wrapper.
