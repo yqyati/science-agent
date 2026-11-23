@@ -1,0 +1,34 @@
+{
+  "source": "/mnt/shared-storage-user/ai4sgi-gpfs1/scientific_reasoning_and_research/yufangchen/rollout/verifiable_1K_DSH_v451-p9/support/training_problems_version1114",
+  "records": 1000,
+  "buckets": {
+    "target400": 400,
+    "source300": 300,
+    "general300": 300
+  },
+  "sha256": "1dc677e8e49408c64b6315ce8a6c70dae397719040a4e5f1eb325a2bd72a7131",
+  "verifier_sha256": {
+    "verify_candidate.py": "afea539c713c354e13c6d3d3c9ae32d80f379a9abe305f82380e7904bcee98bc",
+    "validate_dataset.py": "8e0ccb0e2789fa194117bfa58008135c7761441ee6839c6819e54af6b905cb0c",
+    "final/target400/agent_verifier.py": "d34fd4b66516add4a6fab2a53fabc1b40d7fce92fe903c199d5bd14c31494580",
+    "final/target400/extra_verifier.py": "f6bbc3f1a3a6e00b8122f7f967f367b212695e4cc1ed11331818af746a5bea80",
+    "final/target400/graph_iso.py": "80ff935568711d36bb51e73e42134370c2c86ae27df00d834918052d5aba0c44",
+    "final/target400/uncertainty_lp.py": "40b24391850313cd2ec53ea12f506a36d73e59a2288cc69934acd008f4e0fe5a",
+    "final/target400/vendor_edges.py": "2c92f19d547a16ea4a3e5e7f699f7098366bdd4b5269139b1b9af27cd2fbdf1f",
+    "final/target400/vendor_kakeya.py": "2a8dc0d9381e24c822dbca2aa60f544d97ee60e45a89aff228f12ad32dc69170",
+    "final/target400/verifier.py": "49a72f9184b20f9ab9fa584a3b47e3f267b952ef3c6dc6730b296f292a924e14",
+    "final/target400/problems.jsonl": "9ecd55e1ef1332a03c21d8a719c99a22334cb33a728bc50ce9d57807d4fe5f74",
+    "final/source300/verifier.py": "5d288f87ee4cb9db7b8a2861e5543baabc90cbd6c2885e29131996a8d652907e",
+    "final/source300/problems.jsonl": "46a61a3e0c61ab6abc14f94e0ede07e87427c58e8f2fa8b3d383aa1ae5c81de3",
+    "final/general300/verifier.py": "1cff3161a0ab38bcd10510df6d65bf1e5e075309c11988920742fc8971d783a8",
+    "final/general300/problems.jsonl": "cf89fd8a571071200a3efc2174928393f904adb71128b8927793cacb6ff69fa0"
+  },
+  "private_answers_copied": false,
+  "teacher_answers_in_prompt": false,
+  "reward_baseline": "public qa.baseline_score; label only, not prompt",
+  "target400_included": true,
+  "target400_source": "20 OpenProblemBench-L2 + 29 EinsteinArena seeds",
+  "selection": "All 1000 questions included at user request; not an evaluation-disjoint claim",
+  "label_encoding": "json_string",
+  "source_dataset_sha256": "b1338b66f5713fab211b6e020730831b7c6488b93479c8fce190b89759c041ab"
+}

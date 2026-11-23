@@ -1,0 +1,21 @@
+{
+  "sdk_source": "/mnt/shared-storage-gpfs2/ai4sgi-gpfs2/yangqingyu/workspace/student35b_streamfix_acceptance_20261117/sdk",
+  "profile_source": "/mnt/shared-storage-gpfs2/ai4sgi-gpfs2/scientific_reasoning_and_research/jiangyichen/p1-shared-2/ReAct/harness/deepseek-harness/.local/dsh-profile-seed/profiles/sdk",
+  "bwrap_source": "/mnt/shared-storage-gpfs2/ai4sgi-gpfs2/scientific_reasoning_and_research/jiangyichen/p1-shared-2/ReAct/harness/codex/.local/codex-home/packages/standalone/releases/0.153.2-x86_64-unknown-linux-musl/codex-resources/bwrap",
+  "files": {
+    "bwrap": "01fb705f067bd5365b63d8ad2323a61c8d007733ca5e649437e086f3fb9935d8",
+    "deepseek_harness/errors.py": "0d380a8947c7cc64dc1811660816b89fe676fac46b3cfcf18a51ecafc6bf28da",
+    "deepseek_harness/models.py": "c8cba1cdf77017506ab5a01e53c3c8e5b36bfe941cc3e51d40580cd9407a35be",
+    "deepseek_harness/client.py": "78193d6b88d49b87dc0057ec92cbc512426e7712f75c3e700f0fc7e0046d28fc",
+    "deepseek_harness/__init__.py": "0511648a19b7f0e639f2dd4fe2cb972039c8e794be57546422ac519004992e4b",
+    "deepseek_harness/api.py": "9e24adee62987e38e0577c4ba051b15b015f61cd5d5412dc56882094f5e52c2b",
+    "deepseek_harness_runtime/__init__.py": "782b2ae248cc9d2af5f174f1be82bc7ddab967baf3c83e29ebab920a940813d7",
+    "deepseek_harness_runtime/deepseek-harness-runtime.json": "ec73c74ade71bd942dc9937ef927bcb44240ee22041bf76237ac78824ce63ede",
+    "deepseek_harness_runtime/runtime/deepseek-harness-sdk-runtime-linux-x64-rg": "193906679498de4d939345b937fa24e0e69a03c244bd70c859f5e41232713f21",
+    "deepseek_harness_runtime/runtime/deepseek-harness-sdk-runtime-linux-x64": "8ae368a6c2bfbe46a1f11e4f80926c27f2bfe342bff1e370157d0a5240744302",
+    "profile/cordis.patch.yml": "ef189a8c27db6d63930aa3046a3040482e952eafcb7487c644d508e8d461f027",
+    "profile/pnpm-workspace.yaml": "ae7c5b68e2f157528e62885804e69e88583897b775e03c86fcbe52feaf498aba",
+    "profile/package.json": "da521592a0b2d6bbb85376f3069ad9efdd1d5edc4e61f36957fffb8d56f03ed2",
+    "profile/cordis.yml": "c300dcf2ebc5f02062d6591268d29d3db6fe45e0cb138f5467276fe2ba06076e"
+  }
+}
