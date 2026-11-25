@@ -52,8 +52,6 @@ def load_rows(args):
 def configure(args):
     # Set before importing the agent: its loop budgets are import-time constants.
     settings = {
-        'SCIENCE_AGENT_PROGRESS_VERIFIER': '1' if args.progress_verifier else '0',
-        'PROGRESS_VERIFIER_LOG_DIR': str(args.run_dir / 'verifier_audit'),
         'SCIENCE_TRAJECTORY_MAX_TOKENS': str(args.max_context_tokens),
         'QWEN_API_MAX_OUTPUT_TOKENS': str(args.max_output_tokens),
         'AGENT_CONTEXT_COMPACT_THRESHOLD_TOKENS': str(args.soft_context_tokens),
@@ -100,10 +98,7 @@ def configure(args):
 
 
 def make_agent_factory(args):
-    if args.progress_verifier:
-        from react_agent_openai_api_tools_progress import MultiTurnReactAgent
-    else:
-        from react_agent_openai_api_tools import MultiTurnReactAgent
+    from react_agent_openai_api_tools import MultiTurnReactAgent
 
     class APIAgent(MultiTurnReactAgent):
         def _get_api_base(self):
@@ -158,11 +153,6 @@ def make_agent_factory(args):
                              'max_input_tokens': 320000, 'max_retries': 3, 'presence_penalty': 0},
         })
         agent.last_messages = []
-        if args.progress_verifier:
-            agent.progress_verifier_endpoint = {
-                'base_url': args.base_url, 'model': args.model,
-                'api_key': os.environ[args.api_key_env],
-            }
         agent.context_tokens_estimated = True
         agent.image_context_estimated = False
         return agent
@@ -285,8 +275,6 @@ def parse_args(argv=None):
     parser.add_argument('--image-tokens-per-image', type=int, default=4096,
                         help='Estimated context cost per API image; actual accounting depends on the endpoint')
     parser.add_argument('--workers', type=int, default=16)
-    parser.add_argument('--progress-verifier', action='store_true',
-                        help='Enable asynchronous progress verification using the solver model in an independent context')
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--top-p', type=float, default=0.95)
     parser.add_argument('--max-context-tokens', type=int, default=122880)
