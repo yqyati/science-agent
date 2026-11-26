@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate HLE through a solver API and Sandbox tools, without Molt or Ray."""
+"""Evaluate science benchmarks through a solver API and Sandbox tools, without Molt or Ray."""
 from __future__ import annotations
 
 import argparse
@@ -31,6 +31,9 @@ def artifact(args, kind, row):
 
 
 def load_rows(args):
+    if args.benchmark != 'hle':
+        from science_agent.eval.api_benchmarks import load_benchmark_rows
+        return load_benchmark_rows(args)
     rows = []
     for line in args.input.read_text().splitlines():
         if not line.strip():
@@ -56,7 +59,7 @@ def configure(args):
         'QWEN_API_MAX_OUTPUT_TOKENS': str(args.max_output_tokens),
         'AGENT_CONTEXT_COMPACT_THRESHOLD_TOKENS': str(args.soft_context_tokens),
         'AGENT_CONTEXT_COMPACTION': '0', 'AGENT_CONTEXT_COMPACT_MAX_COMPACTIONS': '0',
-        'AGENT_OBSERVATION_MASKING': '0', 'AGENT_EVAL_FORCE_FINALIZE': '1',
+        'AGENT_OBSERVATION_MASKING': '0', 'AGENT_EVAL_FORCE_FINALIZE': '1' if args.benchmark == 'hle' else '0',
         'AGENT_ANSWER_TYPE': 'boxed', 'OPENAI_COMPAT_USE_SYSTEM_PROMPT': '1',
         'AGENT_EVAL_FORCE_FINAL_DISABLE_THINKING': '0',
         'AGENT_EVAL_FORCE_FINAL_MAX_OUTPUT_TOKENS': '0', 'MAX_TOOL_CALLS_PER_RUN': '0',
@@ -167,7 +170,10 @@ def hle_candidate(text):
     return '' if prediction.casefold() in {'your answer', 'your final answer'} else prediction
 
 
-def judge_messages(row, prediction):
+def judge_messages(row, prediction, benchmark='hle'):
+    if benchmark != 'hle':
+        from science_agent.eval.api_benchmarks import benchmark_judge_messages
+        return benchmark_judge_messages(benchmark, row, prediction)
     # Match the HLE protocol used by the Molt adapter.
     return [
         {'role': 'system', 'content': 'You are a strict grader for problems across all academic disciplines. Given a problem and a candidate solution, decide whether the candidate answer is correct. Be strict: the final answer must match the ground truth (allow equivalent forms).'},
@@ -203,7 +209,11 @@ async def run_question(row, args, create_agent, judge_answer, secrets):
                        'termination': 'solver exception', 'error': safe_error(exc, secrets)}
         rollout.update(question_id=row['question_id'], elapsed_seconds=time.monotonic() - started,
                        context_tokens_estimated=agent.context_tokens_estimated)
-        rollout['prediction'] = hle_candidate(rollout.get('prediction'))
+        if args.benchmark == 'hle':
+            rollout['prediction'] = hle_candidate(rollout.get('prediction'))
+        else:
+            from science_agent.eval.api_benchmarks import extract_prediction
+            rollout['prediction'] = extract_prediction(args.benchmark, rollout.get('prediction'))
         save_json(rollout_path, rollout)
         # A deliberately retried rollout invalidates its old grade.
         grade_path.unlink(missing_ok=True)
@@ -220,7 +230,7 @@ async def run_question(row, args, create_agent, judge_answer, secrets):
         grade = {'status': 'empty_answer', 'correct': False, 'score': 0, 'judge': None}
     else:
         try:
-            result = await judge_answer(judge_messages(row, prediction), require_score=False)
+            result = await judge_answer(judge_messages(row, prediction, args.benchmark), require_score=False)
             valid = result['judge_result'] is not None
             correct = bool((result['judge_result'] or {}).get('correct'))
             grade = {'status': 'graded' if valid else 'judge_error', 'correct': correct,
@@ -261,8 +271,10 @@ def summarize(rows, args):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--input', type=Path, default=DEFAULT_SOURCE)
-    parser.add_argument('--expected-rows', type=int, default=360)
+    from science_agent.eval.api_benchmarks import BENCHMARKS
+    parser.add_argument('--benchmark', choices=BENCHMARKS, default='hle')
+    parser.add_argument('--input', type=Path, default=None)
+    parser.add_argument('--expected-rows', type=int, default=None)
     parser.add_argument('--limit', type=int, default=0, help='First N questions for a smoke run; 0 means all')
     parser.add_argument('--run-dir', type=Path, required=True)
     parser.add_argument('--base-url', default=os.getenv('HLE_API_BASE_URL', ''))
@@ -284,10 +296,16 @@ def parse_args(argv=None):
     parser.add_argument('--task-timeout', type=int, default=9000)
     parser.add_argument('--request-timeout', type=int, default=600)
     parser.add_argument('--sandbox-resource', default='10.12.111.143/ailab-ai4sgi')
-    parser.add_argument('--dataset-base-dir', type=Path, default=Path('/mnt/shared-storage-gpfs2/ai4sgi-gpfs2/scientific_reasoning_and_research/liuzhuo/HLE_tool_v1'))
-    parser.add_argument('--stage', choices=['all', 'rollout', 'judge', 'summary'], default='all')
+    parser.add_argument('--dataset-base-dir', type=Path, default=None)
+    parser.add_argument('--stage', choices=['prepare', 'all', 'rollout', 'judge', 'summary'], default='all')
     parser.add_argument('--retry-failed', action='store_true', help='Retry empty/failed rollouts, or invalid grades; judge stage never regenerates')
     args = parser.parse_args(argv)
+    default_input, default_count = BENCHMARKS[args.benchmark]
+    args.input = args.input if args.input is not None else default_input
+    args.expected_rows = args.expected_rows if args.expected_rows is not None else default_count
+    if args.dataset_base_dir is None:
+        args.dataset_base_dir = (Path('/mnt/shared-storage-gpfs2/ai4sgi-gpfs2/scientific_reasoning_and_research/liuzhuo/HLE_tool_v1')
+                                 if args.benchmark == 'hle' else args.input.resolve().parent)
     args.run_dir = args.run_dir.resolve()
     if not 0 < args.soft_context_tokens < args.max_context_tokens:
         parser.error('Require 0 < soft context threshold < hard context limit')
@@ -299,7 +317,7 @@ def parse_args(argv=None):
         url = urlsplit(args.base_url)
         if url.scheme not in {'http', 'https'} or not url.hostname or url.username or url.password or url.query or url.fragment:
             parser.error('base-url must be an HTTP(S) endpoint without embedded credentials, query or fragment')
-    if args.stage != 'summary' and (not args.base_url or not args.model):
+    if args.stage not in {'prepare', 'summary'} and (not args.base_url or not args.model):
         parser.error('Set --base-url and --model (or HLE_API_BASE_URL and HLE_API_MODEL)')
     if args.stage in {'all', 'rollout'} and not os.getenv(args.api_key_env):
         parser.error(f'Set solver API key in {args.api_key_env}; use EMPTY for an unauthenticated internal service')
@@ -315,6 +333,12 @@ def main(argv=None):
     import fcntl
     with (args.run_dir / '.lock').open('w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if args.stage == 'prepare':
+            if (args.run_dir / 'manifest.json').exists():
+                raise ValueError('Prepare requires a directory without an existing evaluation manifest')
+            save_json(saved_dataset, rows)
+            print(json.dumps({'benchmark': args.benchmark, 'selected': len(rows), 'dataset': str(saved_dataset)}))
+            return
         if args.stage == 'summary':
             print(json.dumps(summarize(rows, args), ensure_ascii=False))
             return
