@@ -2,7 +2,7 @@
 
 科学问题求解 Harness，提供多轮推理、搜索、网页阅读、Python 工具和答案判分。支持两种使用方式：
 
-- **直接调用模型 API 评估 HLE360**：使用本仓库的独立入口，无需 Molt、Ray、本地模型权重或训练 GPU。
+- **直接调用模型 API 评估**：支持 HLE360、AMO、FrontierScience Olympiad、IMO AnswerBench、CMT，无需 Molt、Ray、本地模型权重或训练 GPU。多数据集用法见 [Science API 评测](docs/science_api.md)；CritPt 使用[专用入口](docs/critpt.md)。
 - **接入 Molt 训练或评估**：由 Molt 提供模型推理接口并记录训练轨迹，Harness 负责解题和工具执行。
 
 以下说明独立 API 评估的使用方法。模型 API、工具沙盒与 Judge 的地址和凭据分别配置。
